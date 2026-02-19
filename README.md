@@ -18,7 +18,5 @@ UI: http://<pi-ip>:3000/ui`
 
 `xm407@malina:~/workspace/pi_server/scripts $ source oled-env/bin/activate`
 
-`(oled-env) xm407@malina:~/workspace/pi_server/scripts $`
-
 `(oled-env) xm407@malina:~/workspace/pi_server/scripts $ python oled_stats.py`
 

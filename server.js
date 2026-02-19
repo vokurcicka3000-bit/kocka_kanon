@@ -6,6 +6,7 @@ const fs = require("fs");
 // -------------------- State files --------------------
 const RELAY_STATE_FILE = "/tmp/relay_state.txt";
 const OLED_PID_FILE = "/tmp/oled_stats.pid";
+const CAMERA_PID_FILE = "/tmp/camera.pid";
 
 function writeRelayState(state) {
   try {
@@ -34,6 +35,30 @@ function writeOledPid(pid) {
 function clearOledPid() {
   try {
     fs.unlinkSync(OLED_PID_FILE);
+  } catch (e) {
+    // ignore
+  }
+}
+
+function readCameraPid() {
+  try {
+    return parseInt(fs.readFileSync(CAMERA_PID_FILE, "utf8").trim(), 10);
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeCameraPid(pid) {
+  try {
+    fs.writeFileSync(CAMERA_PID_FILE, String(pid), { encoding: "utf8" });
+  } catch (e) {
+    console.error("Failed to write camera PID:", e);
+  }
+}
+
+function clearCameraPid() {
+  try {
+    fs.unlinkSync(CAMERA_PID_FILE);
   } catch (e) {
     // ignore
   }
@@ -201,6 +226,132 @@ app.get("/oled", (req, res) => {
   res.type("text").send(`OLED status: ${running ? `running (PID ${pid})` : "stopped"}\n`);
 });
 
+let cameraProcess = null;
+let cameraClients = new Set();
+let frameBuffer = Buffer.alloc(0);
+
+function broadcastFrame(chunk) {
+  frameBuffer = Buffer.concat([frameBuffer, chunk]);
+  
+  const jpegStart = Buffer.from([0xff, 0xd8]);
+  const jpegEnd = Buffer.from([0xff, 0xd9]);
+  
+  while (true) {
+    const startIdx = frameBuffer.indexOf(jpegStart);
+    if (startIdx === -1) break;
+    
+    const endIdx = frameBuffer.indexOf(jpegEnd, startIdx);
+    if (endIdx === -1) break;
+    
+    const frame = frameBuffer.subarray(startIdx, endIdx + 2);
+    frameBuffer = frameBuffer.subarray(endIdx + 2);
+    
+    const header = `--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`;
+    for (const client of cameraClients) {
+      try {
+        client.write(header);
+        client.write(frame);
+        client.write("\r\n");
+      } catch (e) {
+        cameraClients.delete(client);
+      }
+    }
+  }
+}
+
+// API: /camera?action=start|stop|status
+app.get("/camera", (req, res) => {
+  const action = String(req.query.action || "status").toLowerCase();
+  const pid = readCameraPid();
+  const running = isProcessRunning(pid);
+  console.log(`[Camera] action=${action}, pid=${pid}, running=${running}`);
+
+  if (action === "start") {
+    if (running) {
+      res.type("text").send(`Camera already running (PID ${pid})\n`);
+      return;
+    }
+    frameBuffer = Buffer.alloc(0);
+    cameraClients.clear();
+    
+    cameraProcess = spawn("rpicam-vid", [
+      "-t", "0",
+      "--codec", "mjpeg",
+      "--width", "1280",
+      "--height", "720",
+      "--framerate", "30",
+      "-o", "-"
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+
+    cameraProcess.stdout.on("data", broadcastFrame);
+    cameraProcess.on("error", (err) => console.error("[Camera] spawn error:", err));
+    cameraProcess.on("exit", (code) => {
+      console.log("[Camera] exited with code", code);
+      clearCameraPid();
+      cameraProcess = null;
+      cameraClients.clear();
+      frameBuffer = Buffer.alloc(0);
+    });
+
+    writeCameraPid(cameraProcess.pid);
+    setTimeout(() => {
+      if (isProcessRunning(cameraProcess.pid)) {
+        res.type("text").send(`Camera started (PID ${cameraProcess.pid})\n`);
+      } else {
+        res.status(500).type("text").send("Camera failed to start\n");
+      }
+    }, 500);
+    return;
+  }
+
+  if (action === "stop") {
+    if (!running) {
+      clearCameraPid();
+      res.type("text").send("Camera not running\n");
+      return;
+    }
+    if (cameraProcess) {
+      cameraProcess.kill("SIGTERM");
+      cameraProcess = null;
+    }
+    exec(`kill ${pid} 2>/dev/null || pkill -f "rpicam-vid"`, (err) => {
+      if (err) console.error("[Camera] kill error:", err);
+      else console.log("[Camera] kill succeeded for PID", pid);
+      clearCameraPid();
+      res.type("text").send(`Camera stopped (PID ${pid})\n`);
+    });
+    return;
+  }
+
+  res.type("text").send(`Camera status: ${running ? `running (PID ${pid})` : "stopped"}\n`);
+});
+
+app.get("/camera/stream", (req, res) => {
+  const pid = readCameraPid();
+  if (!isProcessRunning(pid) || !cameraProcess) {
+    res.status(503).type("text").send("Camera not running\n");
+    return;
+  }
+
+  res.writeHead(200, {
+    "Content-Type": "multipart/x-mixed-replace; boundary=frame",
+    "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+    "Connection": "close",
+    "Pragma": "no-cache"
+  });
+
+  cameraClients.add(res);
+  
+  req.on("close", () => {
+    cameraClients.delete(res);
+    res.end();
+  });
+  
+  req.on("error", () => {
+    cameraClients.delete(res);
+  });
+});
+
 // Simple UI
 app.get("/ui", (_req, res) => {
   res.type("html").send(`<!doctype html>
@@ -305,6 +456,20 @@ app.get("/ui", (_req, res) => {
     .out-box:empty { display: none; }
 
     .hint { margin-top: 12px; font-size: 14px; opacity: 0.7; }
+
+    #videoContainer:fullscreen {
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #videoContainer:fullscreen img {
+      max-width: 100%;
+      max-height: 100%;
+      width: auto;
+      height: auto;
+    }
   </style>
 </head>
 <body>
@@ -338,6 +503,25 @@ app.get("/ui", (_req, res) => {
       <button class="red" id="oledStopBtn">STOP</button>
     </div>
     <div id="oledOut" class="out-box"></div>
+  </div>
+
+  <h1 style="margin-top:30px;">📹 Camera</h1>
+
+  <div class="card">
+    <div class="row">
+      <span id="cameraStatus">Checking...</span>
+    </div>
+    <div class="row">
+      <button class="green" id="cameraStartBtn">START</button>
+      <button class="red" id="cameraStopBtn">STOP</button>
+    </div>
+    <div id="cameraOut" class="out-box"></div>
+    <div class="row" id="videoContainer" style="display:none;">
+      <img id="videoStream" style="width:100%; border-radius:10px; border:3px solid #000;">
+    </div>
+    <div class="row" id="fullscreenRow" style="display:none;">
+      <button class="blue" id="fullscreenBtn">⛶ FULLSCREEN</button>
+    </div>
   </div>
 
   <script>
@@ -409,6 +593,76 @@ app.get("/ui", (_req, res) => {
     oledStartBtn.addEventListener("click", () => oledApi("start"));
     oledStopBtn.addEventListener("click", () => oledApi("stop"));
     oledCheckStatus();
+
+    // Camera controls
+    const cameraStatus = document.getElementById("cameraStatus");
+    const cameraOut = document.getElementById("cameraOut");
+    const cameraStartBtn = document.getElementById("cameraStartBtn");
+    const cameraStopBtn = document.getElementById("cameraStopBtn");
+    const videoContainer = document.getElementById("videoContainer");
+    const videoStream = document.getElementById("videoStream");
+    const fullscreenRow = document.getElementById("fullscreenRow");
+    const fullscreenBtn = document.getElementById("fullscreenBtn");
+
+    async function cameraApi(action) {
+      const url = apiBase() + "/camera?action=" + action;
+      cameraOut.textContent = "...";
+      try {
+        const r = await fetch(url, { cache: "no-store" });
+        const t = await r.text();
+        cameraOut.textContent = t;
+      } catch (e) {
+        cameraOut.textContent = "Request failed: " + e;
+      }
+      cameraCheckStatus();
+    }
+
+    async function cameraCheckStatus() {
+      try {
+        const r = await fetch(apiBase() + "/camera?action=status", { cache: "no-store" });
+        const t = await r.text();
+        cameraStatus.textContent = t.trim();
+        if (t.includes("running")) {
+          videoContainer.style.display = "block";
+          fullscreenRow.style.display = "block";
+          if (!videoStream.src || videoStream.src.indexOf("/camera/stream") === -1) {
+            videoStream.src = apiBase() + "/camera/stream?" + Date.now();
+          }
+        } else {
+          videoContainer.style.display = "none";
+          fullscreenRow.style.display = "none";
+          videoStream.src = "";
+        }
+      } catch (e) {
+        cameraStatus.textContent = "Error: " + e;
+      }
+    }
+
+    videoStream.onerror = function() {
+      setTimeout(function() {
+        if (videoContainer.style.display !== "none") {
+          videoStream.src = apiBase() + "/camera/stream?" + Date.now();
+        }
+      }, 1000);
+    };
+
+    fullscreenBtn.addEventListener("click", function() {
+      if (videoContainer.requestFullscreen) {
+        videoContainer.requestFullscreen();
+      } else if (videoContainer.webkitRequestFullscreen) {
+        videoContainer.webkitRequestFullscreen();
+      }
+    });
+
+    document.addEventListener("fullscreenchange", function() {
+      const isFullscreen = document.fullscreenElement === videoContainer;
+      videoStream.style.borderRadius = isFullscreen ? "0" : "10px";
+      videoStream.style.objectFit = isFullscreen ? "contain" : "fill";
+    });
+
+    cameraStartBtn.addEventListener("click", () => cameraApi("start"));
+    cameraStopBtn.addEventListener("click", () => cameraApi("stop"));
+    cameraCheckStatus();
   </script>
 
 </body>

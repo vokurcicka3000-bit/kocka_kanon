@@ -1,7 +1,8 @@
 # Kocka kanon
 
 How to start the project:
-Root folder - /home/xm407/workspace/pi_server
+Root folder - ```/home/xm407/workspace/pi_server
+```
 
 1) Run node server.js - GUI is UP
 

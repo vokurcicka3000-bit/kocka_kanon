@@ -1,3 +1,4 @@
+import signal
 import time
 from collections import deque
 from pathlib import Path
@@ -47,6 +48,16 @@ def clamp(v, lo, hi):
 # ---- I2C + display ----
 i2c = busio.I2C(board.SCL, board.SDA)
 oled = adafruit_ssd1306.SSD1306_I2C(WIDTH, HEIGHT, i2c)
+
+def cleanup():
+  oled.fill(0)
+  oled.show()
+
+def handle_signal(signum, frame):
+  raise SystemExit
+
+signal.signal(signal.SIGTERM, handle_signal)
+signal.signal(signal.SIGINT, handle_signal)
 
 oled.fill(0)
 oled.show()
@@ -132,6 +143,7 @@ try:
         oled.show()
         time.sleep(1)
 
-except KeyboardInterrupt:
-    oled.fill(0)
-    oled.show()
+except (KeyboardInterrupt, SystemExit):
+  pass
+finally:
+  cleanup()

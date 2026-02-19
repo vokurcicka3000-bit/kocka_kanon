@@ -1,4 +1,4 @@
-# kocka_kanon
+# Kocka kanon
 
 How to start the project:
 Root folder - /home/xm407/workspace/pi_server

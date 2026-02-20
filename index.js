@@ -5,8 +5,8 @@ const fs = require("fs");
 
 // -------------------- State files --------------------
 const RELAY_STATE_FILE = "/tmp/relay_state.txt";
-const OLED_PID_FILE = "/tmp/oled_stats.pid";
 const CAMERA_PID_FILE = "/tmp/camera.pid";
+const SERVO_STATE_FILE = "/tmp/servo_state.txt";
 
 function writeRelayState(state) {
   try {
@@ -16,27 +16,24 @@ function writeRelayState(state) {
   }
 }
 
-function readOledPid() {
+function readServoState() {
   try {
-    return parseInt(fs.readFileSync(OLED_PID_FILE, "utf8").trim(), 10);
+    const data = fs.readFileSync(SERVO_STATE_FILE, "utf8").trim();
+    const parts = data.split(",");
+    return {
+      horizontal: parseFloat(parts[0]) || 90,
+      vertical: parseFloat(parts[1]) || 90
+    };
   } catch (e) {
-    return null;
+    return { horizontal: 90, vertical: 90 };
   }
 }
 
-function writeOledPid(pid) {
+function writeServoState(horizontal, vertical) {
   try {
-    fs.writeFileSync(OLED_PID_FILE, String(pid), { encoding: "utf8" });
+    fs.writeFileSync(SERVO_STATE_FILE, `${horizontal},${vertical}\n`, { encoding: "utf8" });
   } catch (e) {
-    console.error("Failed to write OLED PID:", e);
-  }
-}
-
-function clearOledPid() {
-  try {
-    fs.unlinkSync(OLED_PID_FILE);
-  } catch (e) {
-    // ignore
+    console.error("Failed to write servo state:", e);
   }
 }
 
@@ -77,11 +74,17 @@ function isProcessRunning(pid) {
 // -------------------- Config --------------------
 const PORT = 3000;
 const SCRIPT = path.join(__dirname, "scripts", "relecko.py");
-const OLED_SCRIPT = path.join(__dirname, "scripts", "oled_stats.py");
+const SERVO_SCRIPT = path.join(__dirname, "scripts", "servo.py");
+const SERVO_PYTHON = path.join(__dirname, "scripts", "servo-env", "bin", "python");
 const MODES = new Set(["on", "off", "pulse"]);
 const PULSE_MIN_MS = 50;
 const PULSE_MAX_MS = 5000;
 const PULSE_DEFAULT_MS = 500;
+const SERVO_STEP = 10;
+const SERVO_MIN = 0;
+const SERVO_MAX = 180;
+const SERVO_H_CHANNEL = 0;
+const SERVO_V_CHANNEL = 1;
 
 // -------------------- Helpers --------------------
 function clampInt(value, min, max, fallback) {
@@ -131,6 +134,32 @@ function runPython(scriptPath, args = []) {
   });
 }
 
+function runServoPython(args = []) {
+  return new Promise((resolve, reject) => {
+    const py = spawn(SERVO_PYTHON, ["-u", SERVO_SCRIPT, ...args], {
+      env: { ...process.env, PYTHONUNBUFFERED: "1" },
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    py.stdout.on("data", (d) => (stdout += d.toString()));
+    py.stderr.on("data", (d) => (stderr += d.toString()));
+
+    py.on("error", (err) => {
+      reject(new Error(`Failed to start servo python: ${err.message}`));
+    });
+
+    py.on("close", (code) => {
+      resolve({
+        code,
+        stdout: stdout.trim(),
+        stderr: stderr.trim(),
+      });
+    });
+  });
+}
+
 // -------------------- App --------------------
 const app = express();
 
@@ -141,6 +170,20 @@ app.use((req, res, next) => {
 
 // set initial state
 writeRelayState("OFF");
+writeServoState(90, 90);
+
+async function initServos() {
+  try {
+    await Promise.all([
+      runServoPython(["90", String(SERVO_H_CHANNEL)]),
+      runServoPython(["90", String(SERVO_V_CHANNEL)])
+    ]);
+    console.log("Servos initialized to 90°");
+  } catch (e) {
+    console.error("Failed to initialize servos:", e);
+  }
+}
+initServos();
 
 app.get("/", (_req, res) => {
   res.type("text").send("Hello from Express on Raspberry Pi!\nTry /ui\n");
@@ -172,58 +215,90 @@ app.get("/cicka", async (req, res) => {
   }
 });
 
-// API: /oled?action=start|stop|status
-app.get("/oled", (req, res) => {
-  const action = String(req.query.action || "status").toLowerCase();
-  const pid = readOledPid();
-  const running = isProcessRunning(pid);
-  console.log(`[OLED] action=${action}, pid=${pid}, running=${running}`);
-
-  if (action === "start") {
-    if (running) {
-      res.type("text").send(`OLED already running (PID ${pid})\n`);
-      return;
-    }
-    const venvPython = path.join(__dirname, "scripts", "oled-env", "bin", "python");
-    const py = spawn(venvPython, ["-u", OLED_SCRIPT], {
-      detached: true,
-      env: { ...process.env, PYTHONUNBUFFERED: "1" },
-    });
-    
-    py.stdout.on("data", (d) => console.log("[OLED stdout]", d.toString().trim()));
-    py.stderr.on("data", (d) => console.error("[OLED stderr]", d.toString().trim()));
-    py.on("error", (err) => console.error("[OLED] spawn error:", err));
-    py.on("exit", (code) => console.log("[OLED] exited with code", code));
-    
-    py.unref();
-    writeOledPid(py.pid);
-    setTimeout(() => {
-      if (isProcessRunning(py.pid)) {
-        res.type("text").send(`OLED started (PID ${py.pid})\n`);
-      } else {
-        res.status(500).type("text").send("OLED failed to start\n");
-      }
-    }, 500);
+// API: /servo?dir=up|down|left|right|off
+app.get("/servo", async (req, res) => {
+  const dir = String(req.query.dir || "").toLowerCase();
+  const state = readServoState();
+  
+  if (!["up", "down", "left", "right", "off"].includes(dir)) {
+    res.status(400).type("text").send(`Invalid direction. Use: up, down, left, right, off\nCurrent: H=${state.horizontal}° V=${state.vertical}°\n`);
     return;
   }
-
-  if (action === "stop") {
-    if (!running) {
-      clearOledPid();
-      res.type("text").send("OLED not running\n");
-      return;
+  
+  if (dir === "off") {
+    try {
+      await Promise.all([
+        runServoPython(["off", String(SERVO_H_CHANNEL)]),
+        runServoPython(["off", String(SERVO_V_CHANNEL)])
+      ]);
+      res.type("text").send("Servos disabled (PWM off)\n");
+    } catch (err) {
+      console.error(err);
+      res.status(500).type("text").send(`Node error:\n${err.message}\n`);
     }
-    exec(`kill ${pid} 2>/dev/null || pkill -f "oled_stats.py"`, (err) => {
-      if (err) console.error("[OLED] kill error:", err);
-      else console.log("[OLED] kill succeeded for PID", pid);
-      clearOledPid();
-      res.type("text").send(`OLED stopped (PID ${pid})\n`);
-    });
     return;
   }
+  
+  let newH = state.horizontal;
+  let newV = state.vertical;
+  
+  if (dir === "left") newH = Math.max(SERVO_MIN, newH - SERVO_STEP);
+  if (dir === "right") newH = Math.min(SERVO_MAX, newH + SERVO_STEP);
+  if (dir === "up") newV = Math.min(SERVO_MAX, newV + SERVO_STEP);
+  if (dir === "down") newV = Math.max(SERVO_MIN, newV - SERVO_STEP);
+  
+  try {
+    const commands = [];
+    const labels = [];
+    
+    if (newH !== state.horizontal) {
+      commands.push(runServoPython([String(newH), String(SERVO_H_CHANNEL)]));
+      labels.push({ name: "H", from: state.horizontal, to: newH });
+    }
+    if (newV !== state.vertical) {
+      commands.push(runServoPython([String(newV), String(SERVO_V_CHANNEL)]));
+      labels.push({ name: "V", from: state.vertical, to: newV });
+    }
+    
+    if (commands.length === 0) {
+      res.type("text").send(`H: ${newH}° (limit reached)\nV: ${newV}° (limit reached)\n`);
+      return;
+    }
+    
+    const results = await Promise.all(commands);
+    writeServoState(newH, newV);
+    
+    let output = "";
+    for (let i = 0; i < labels.length; i++) {
+      const l = labels[i];
+      output += `${l.name}: ${l.from}° → ${l.to}°\n${textResponse(results[i])}\n`;
+    }
+    res.type("text").send(output);
+  } catch (err) {
+    console.error(err);
+    res.status(500).type("text").send(`Node error:\n${err.message}\n`);
+  }
+});
 
-  // status
-  res.type("text").send(`OLED status: ${running ? `running (PID ${pid})` : "stopped"}\n`);
+// API: /servo/status
+app.get("/servo/status", (_req, res) => {
+  const state = readServoState();
+  res.type("text").send(`H: ${state.horizontal}° V: ${state.vertical}°\n`);
+});
+
+// API: /servo/center - reset to 90°
+app.get("/servo/center", async (_req, res) => {
+  try {
+    const [hResult, vResult] = await Promise.all([
+      runServoPython(["90", String(SERVO_H_CHANNEL)]),
+      runServoPython(["90", String(SERVO_V_CHANNEL)])
+    ]);
+    writeServoState(90, 90);
+    res.type("text").send(`Centered: H=90° V=90°\n${textResponse(hResult)}${textResponse(vResult)}`);
+  } catch (err) {
+    console.error(err);
+    res.status(500).type("text").send(`Node error:\n${err.message}\n`);
+  }
 });
 
 let cameraProcess = null;
@@ -649,11 +724,11 @@ app.get("/ui", (_req, res) => {
         <button class="arrow-btn" id="aimUp">▲</button>
         <div class="arrow-btn empty"></div>
         <button class="arrow-btn" id="aimLeft">◀</button>
-        <div class="arrow-btn empty"></div>
+        <button class="arrow-btn" id="aimCenter" style="font-size:18px;background:var(--green);">⊙</button>
         <button class="arrow-btn" id="aimRight">▶</button>
         <div class="arrow-btn empty"></div>
         <button class="arrow-btn" id="aimDown">▼</button>
-        <div class="arrow-btn empty"></div>
+        <button class="arrow-btn" id="aimOff" style="font-size:14px;background:var(--red);">OFF</button>
       </div>
     </div>
     <div id="cameraOut" class="out-box"></div>
@@ -668,16 +743,6 @@ app.get("/ui", (_req, res) => {
       <button class="red" id="offBtn">OFF</button>
     </div>
     <div id="out" class="out-box">Ready.</div>
-  </div>
-
-  <div class="small-card">
-    <h3>📺 OLED Display</h3>
-    <span id="oledStatus" class="status-text">Checking...</span>
-    <div class="row">
-      <button class="green" id="oledStartBtn">START</button>
-      <button class="red" id="oledStopBtn">STOP</button>
-    </div>
-    <div id="oledOut" class="out-box"></div>
   </div>
 
   <div id="iosFullscreen">
@@ -698,8 +763,6 @@ app.get("/ui", (_req, res) => {
     const fullscreenBtn = document.getElementById("fullscreenBtn");
     const qualitySelect = document.getElementById("qualitySelect");
     const connectionQuality = document.getElementById("connectionQuality");
-    const oledStatus = document.getElementById("oledStatus");
-    const oledOut = document.getElementById("oledOut");
 
     let detectedQuality = "low";
 
@@ -721,25 +784,28 @@ app.get("/ui", (_req, res) => {
     document.getElementById("onBtn").addEventListener("click", () => call("/cicka?mode=on"));
     document.getElementById("offBtn").addEventListener("click", () => call("/cicka?mode=off"));
 
-    async function oledApi(action) {
-      const url = apiBase() + "/oled?action=" + action;
-      oledOut.textContent = "...";
+    async function moveServo(dir) {
+      const url = apiBase() + "/servo?dir=" + dir;
       try {
-        oledOut.textContent = await (await fetch(url, { cache: "no-store" })).text();
+        await fetch(url, { cache: "no-store" });
       } catch (e) {
-        oledOut.textContent = "Error: " + e;
-      }
-      oledCheckStatus();
-    }
-    async function oledCheckStatus() {
-      try {
-        oledStatus.textContent = await (await fetch(apiBase() + "/oled?action=status", { cache: "no-store" })).text();
-      } catch (e) {
-        oledStatus.textContent = "Error: " + e;
+        console.error("Servo error:", e);
       }
     }
-    document.getElementById("oledStartBtn").addEventListener("click", () => oledApi("start"));
-    document.getElementById("oledStopBtn").addEventListener("click", () => oledApi("stop"));
+    async function centerServo() {
+      const url = apiBase() + "/servo/center";
+      try {
+        await fetch(url, { cache: "no-store" });
+      } catch (e) {
+        console.error("Servo error:", e);
+      }
+    }
+    document.getElementById("aimUp").addEventListener("click", () => moveServo("up"));
+    document.getElementById("aimDown").addEventListener("click", () => moveServo("down"));
+    document.getElementById("aimLeft").addEventListener("click", () => moveServo("left"));
+    document.getElementById("aimRight").addEventListener("click", () => moveServo("right"));
+    document.getElementById("aimCenter").addEventListener("click", centerServo);
+    document.getElementById("aimOff").addEventListener("click", () => moveServo("off"));
 
     async function testConnectionQuality() {
       connectionQuality.textContent = "Testing...";
@@ -842,14 +908,7 @@ app.get("/ui", (_req, res) => {
       }
     });
 
-    // Arrow buttons (placeholder - can be connected to servos later)
-    document.getElementById("aimUp").addEventListener("click", () => console.log("Aim Up"));
-    document.getElementById("aimDown").addEventListener("click", () => console.log("Aim Down"));
-    document.getElementById("aimLeft").addEventListener("click", () => console.log("Aim Left"));
-    document.getElementById("aimRight").addEventListener("click", () => console.log("Aim Right"));
-
     // Auto-start camera on load
-    oledCheckStatus();
     testConnectionQuality().then(() => cameraApi("start"));
   </script>
 </body>

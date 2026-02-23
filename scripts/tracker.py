@@ -81,6 +81,18 @@ FRAME_GAP      = 3
 FREEZE_FRAMES  = 10
 
 
+# ---- Idle scan tuning ----
+# How long (seconds) without a detected face before idle scan kicks in.
+IDLE_TIMEOUT_S  = 2.0
+# Degrees to step per scan tick.
+SCAN_STEP       = 3
+# Seconds between scan steps.
+SCAN_INTERVAL_S = 0.35
+# Horizontal limits for the scan sweep (degrees, within 0-270 range).
+SCAN_MIN        = 60
+SCAN_MAX        = 210
+
+
 # ---- MJPEG stream reader ----
 def iter_mjpeg_frames(url, timeout=15):
     req = urllib.request.urlopen(url, timeout=timeout)
@@ -128,6 +140,12 @@ def run_face():
     ready_sent   = False
     frame_cx     = dead_zone_px = min_face_px = None
     last_move_t  = 0.0
+    last_seen_t  = 0.0   # last time a face was detected
+    last_scan_t  = 0.0   # last idle scan step
+    scan_dir     = 1     # +1 = sweeping right (increasing degrees), -1 = left
+    # Local estimate of the horizontal servo position (degrees).
+    # Initialised to centre; updated whenever we emit a MOVE.
+    servo_est    = 135
 
     for jpeg in iter_mjpeg_frames(STREAM_URL):
         arr   = np.frombuffer(jpeg, dtype=np.uint8)
@@ -140,13 +158,13 @@ def run_face():
             frame_cx     = w // 2
             dead_zone_px = w * DEAD_ZONE_FRAC
             min_face_px  = int(w * MIN_FACE_FRAC)
+            last_seen_t  = time.monotonic()  # don't scan immediately on start
             print("READY", flush=True)
             ready_sent = True
 
         now = time.monotonic()
-        if now - last_move_t < COOLDOWN_S:
-            continue
 
+        # ---- Detection ----
         small = cv2.resize(frame, (int(w * DETECT_SCALE), int(h * DETECT_SCALE)))
         small = cv2.equalizeHist(small)
 
@@ -157,22 +175,39 @@ def run_face():
             minSize      = (min_face_px, min_face_px),
         )
 
-        if not len(faces):
+        face_found = len(faces) > 0
+
+        # ---- Tracking move (face visible) ----
+        if face_found:
+            last_seen_t = now
+
+            if now - last_move_t >= COOLDOWN_S:
+                x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+                cx = int((x + fw / 2) / DETECT_SCALE)
+
+                error_px = cx - frame_cx  # type: ignore[operator]
+                if abs(error_px) >= dead_zone_px:  # type: ignore[operator]
+                    delta = -round(error_px * KP)
+                    delta = max(-MAX_DELTA, min(MAX_DELTA, delta))
+                    if abs(delta) >= MIN_DELTA:
+                        print(f"MOVE {delta}", flush=True)
+                        servo_est   = max(SCAN_MIN, min(SCAN_MAX, servo_est + delta))
+                        last_move_t = now
+
+        # ---- Idle scan (no face for IDLE_TIMEOUT_S) ----
+        else:
             print("LOST", flush=True)
-            continue
-
-        x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-        cx = int((x + fw / 2) / DETECT_SCALE)
-
-        error_px = cx - frame_cx  # type: ignore[operator]
-        if abs(error_px) < dead_zone_px:  # type: ignore[operator]
-            continue
-
-        delta = -round(error_px * KP)
-        delta = max(-MAX_DELTA, min(MAX_DELTA, delta))
-        if abs(delta) >= MIN_DELTA:
-            print(f"MOVE {delta}", flush=True)
-            last_move_t = now
+            idle = now - last_seen_t
+            if idle >= IDLE_TIMEOUT_S and now - last_scan_t >= SCAN_INTERVAL_S:
+                # Bounce at limits
+                if servo_est >= SCAN_MAX:
+                    scan_dir = -1
+                elif servo_est <= SCAN_MIN:
+                    scan_dir = 1
+                delta = scan_dir * SCAN_STEP
+                print(f"MOVE {delta}", flush=True)
+                servo_est   = max(SCAN_MIN, min(SCAN_MAX, servo_est + delta))
+                last_scan_t = now
 
 
 # ---- Motion tracking ----

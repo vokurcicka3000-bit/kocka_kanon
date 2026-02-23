@@ -47,13 +47,13 @@ CASCADE_XML = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.x
 # ---- Shared tuning ----
 # Proportional gain: servo degrees per pixel of horizontal error.
 # Higher = more aggressive tracking.
-KP             = 0.12
+KP             = 0.09
 # Dead zone: fraction of frame width around centre — no correction inside this band.
 # Smaller = reacts to smaller offsets.
 DEAD_ZONE_FRAC = 0.04
 # After a MOVE, wait this long before the next one (lets servo settle).
 # Shorter = more responsive, but too short causes oscillation.
-COOLDOWN_S     = 0.15
+COOLDOWN_S     = 0.25
 # Maximum single-step servo move in degrees.  Prevents wild jumps.
 MAX_DELTA      = 20
 

@@ -50,7 +50,10 @@ CASCADE_XML = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.x
 KP             = 0.09
 # Dead zone: fraction of frame width around centre — no correction inside this band.
 # Smaller = reacts to smaller offsets.
-DEAD_ZONE_FRAC = 0.04
+DEAD_ZONE_FRAC = 0.07
+# Minimum servo move in degrees — steps smaller than this are ignored.
+# Prevents 1-degree corrections that immediately overshoot.
+MIN_DELTA      = 2
 # After a MOVE, wait this long before the next one (lets servo settle).
 # Shorter = more responsive, but too short causes oscillation.
 COOLDOWN_S     = 0.25
@@ -167,7 +170,7 @@ def run_face():
 
         delta = -round(error_px * KP)
         delta = max(-MAX_DELTA, min(MAX_DELTA, delta))
-        if delta != 0:
+        if abs(delta) >= MIN_DELTA:
             print(f"MOVE {delta}", flush=True)
             last_move_t = now
 
@@ -249,7 +252,7 @@ def run_motion():
 
         delta = -round(error_px * KP)
         delta = max(-MAX_DELTA, min(MAX_DELTA, delta))
-        if delta != 0:
+        if abs(delta) >= MIN_DELTA:
             print(f"MOVE {delta}", flush=True)
             last_move_t = now
             # Freeze reference so the pan itself isn't detected as motion

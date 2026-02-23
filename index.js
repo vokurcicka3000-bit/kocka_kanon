@@ -493,16 +493,19 @@ app.get("/tracker", async (req, res) => {
 
         if (line === "LOST") continue;  // nothing to do
 
-        const m = line.match(/^MOVE (-?\d+)$/);
+        const m = line.match(/^MOVE (-?\d+)(?: (-?\d+))?$/);
         if (m && trackerReady && servoReady) {
-          const delta = parseInt(m[1], 10);
+          const dH    = parseInt(m[1], 10);
+          const dV    = m[2] !== undefined ? parseInt(m[2], 10) : 0;
           const state = readServoState();
-          const newH  = Math.max(SERVO_MIN, Math.min(SERVO_MAX, state.horizontal + delta));
-          if (newH !== state.horizontal) {
-            writeServoState(newH, state.vertical);
-            servoCmd(`SET ${SERVO_H_CHANNEL} ${newH}`).catch((e) =>
-              console.error("[Tracker] servo error:", e)
-            );
+          const newH  = Math.max(SERVO_MIN, Math.min(SERVO_MAX, state.horizontal + dH));
+          const newV  = Math.max(SERVO_MIN, Math.min(SERVO_MAX, state.vertical   + dV));
+          const cmds  = [];
+          if (newH !== state.horizontal) cmds.push(servoCmd(`SET ${SERVO_H_CHANNEL} ${newH}`));
+          if (newV !== state.vertical)   cmds.push(servoCmd(`SET ${SERVO_V_CHANNEL} ${newV}`));
+          if (cmds.length) {
+            writeServoState(newH, newV);
+            Promise.all(cmds).catch((e) => console.error("[Tracker] servo error:", e));
           }
         }
       }

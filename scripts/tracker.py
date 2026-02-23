@@ -84,13 +84,16 @@ FREEZE_FRAMES  = 10
 # ---- Idle scan tuning ----
 # How long (seconds) without a detected face before idle scan kicks in.
 IDLE_TIMEOUT_S  = 2.0
-# Degrees to step per scan tick.
+# Degrees to step per scan tick (horizontal).
 SCAN_STEP       = 3
 # Seconds between scan steps.
 SCAN_INTERVAL_S = 0.35
-# Horizontal limits for the scan sweep (degrees, within 0-270 range).
-SCAN_MIN        = 60
-SCAN_MAX        = 210
+# Horizontal sweep limits (degrees).
+SCAN_H_MIN      = 60
+SCAN_H_MAX      = 210
+# Vertical positions for the two scan rows (top and bottom).
+SCAN_V_TOP      = 160   # tilt up
+SCAN_V_BOT      = 110   # tilt down
 
 
 # ---- MJPEG stream reader ----
@@ -142,10 +145,12 @@ def run_face():
     last_move_t  = 0.0
     last_seen_t  = 0.0   # last time a face was detected
     last_scan_t  = 0.0   # last idle scan step
-    scan_dir     = 1     # +1 = sweeping right (increasing degrees), -1 = left
-    # Local estimate of the horizontal servo position (degrees).
+    scan_dir     = 1     # +1 = sweeping right, -1 = left
+    scan_row     = 0     # 0 = top row, 1 = bottom row
+    # Local estimate of the servo position (degrees).
     # Initialised to centre; updated whenever we emit a MOVE.
-    servo_est    = 135
+    servo_h_est  = 135
+    servo_v_est  = 135
 
     for jpeg in iter_mjpeg_frames(STREAM_URL):
         arr   = np.frombuffer(jpeg, dtype=np.uint8)
@@ -191,22 +196,40 @@ def run_face():
                     delta = max(-MAX_DELTA, min(MAX_DELTA, delta))
                     if abs(delta) >= MIN_DELTA:
                         print(f"MOVE {delta}", flush=True)
-                        servo_est   = max(SCAN_MIN, min(SCAN_MAX, servo_est + delta))
+                        servo_h_est = max(SCAN_H_MIN, min(SCAN_H_MAX, servo_h_est + delta))
                         last_move_t = now
 
-        # ---- Idle scan (no face for IDLE_TIMEOUT_S) ----
+        # ---- Idle sonar scan (no face for IDLE_TIMEOUT_S) ----
         else:
             print("LOST", flush=True)
             idle = now - last_seen_t
             if idle >= IDLE_TIMEOUT_S and now - last_scan_t >= SCAN_INTERVAL_S:
-                # Bounce at limits
-                if servo_est >= SCAN_MAX:
+                v_target = SCAN_V_TOP if scan_row == 0 else SCAN_V_BOT
+                dV = 0
+
+                # Step horizontally
+                next_h = servo_h_est + scan_dir * SCAN_STEP
+
+                if next_h > SCAN_H_MAX:
+                    # Hit right edge — clamp, flip direction, advance to next row
+                    next_h   = SCAN_H_MAX
                     scan_dir = -1
-                elif servo_est <= SCAN_MIN:
+                    scan_row = 1 - scan_row
+                    v_target = SCAN_V_TOP if scan_row == 0 else SCAN_V_BOT
+                    dV       = v_target - servo_v_est
+                elif next_h < SCAN_H_MIN:
+                    # Hit left edge — clamp, flip direction, advance to next row
+                    next_h   = SCAN_H_MIN
                     scan_dir = 1
-                delta = scan_dir * SCAN_STEP
-                print(f"MOVE {delta}", flush=True)
-                servo_est   = max(SCAN_MIN, min(SCAN_MAX, servo_est + delta))
+                    scan_row = 1 - scan_row
+                    v_target = SCAN_V_TOP if scan_row == 0 else SCAN_V_BOT
+                    dV       = v_target - servo_v_est
+
+                dH = next_h - servo_h_est
+                if dH != 0 or dV != 0:
+                    print(f"MOVE {dH} {dV}", flush=True)
+                    servo_h_est = next_h
+                    servo_v_est = servo_v_est + dV
                 last_scan_t = now
 
 

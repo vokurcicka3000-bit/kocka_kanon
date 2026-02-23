@@ -20,12 +20,14 @@ function readServoState() {
   try {
     const data = fs.readFileSync(SERVO_STATE_FILE, "utf8").trim();
     const parts = data.split(",");
+    const h = parseFloat(parts[0]);
+    const v = parseFloat(parts[1]);
     return {
-      horizontal: parseFloat(parts[0]) || 90,
-      vertical: parseFloat(parts[1]) || 90
+      horizontal: Number.isFinite(h) ? Math.max(SERVO_MIN, Math.min(SERVO_MAX, h)) : SERVO_CENTER,
+      vertical:   Number.isFinite(v) ? Math.max(SERVO_MIN, Math.min(SERVO_MAX, v)) : SERVO_CENTER
     };
   } catch (e) {
-    return { horizontal: 90, vertical: 90 };
+    return { horizontal: SERVO_CENTER, vertical: SERVO_CENTER };
   }
 }
 
@@ -75,14 +77,17 @@ function isProcessRunning(pid) {
 const PORT = 3000;
 const SCRIPT = path.join(__dirname, "scripts", "relecko.py");
 const SERVO_SCRIPT = path.join(__dirname, "scripts", "servo.py");
+const BEEP_SCRIPT    = path.join(__dirname, "scripts", "beep.py");
+const TRACKER_SCRIPT = path.join(__dirname, "scripts", "tracker.py");
 const SERVO_PYTHON = path.join(__dirname, "scripts", "servo-env", "bin", "python");
 const MODES = new Set(["on", "off", "pulse"]);
 const PULSE_MIN_MS = 50;
 const PULSE_MAX_MS = 5000;
 const PULSE_DEFAULT_MS = 500;
-const SERVO_STEP = 10;
+const SERVO_STEP = 5;
 const SERVO_MIN = 0;
-const SERVO_MAX = 180;
+const SERVO_MAX = 270;
+const SERVO_CENTER = 135;
 const SERVO_H_CHANNEL = 0;
 const SERVO_V_CHANNEL = 1;
 
@@ -134,29 +139,67 @@ function runPython(scriptPath, args = []) {
   });
 }
 
-function runServoPython(args = []) {
+// -------------------- Servo daemon --------------------
+// Single persistent process - avoids set_pwm_freq() glitch on every call.
+let servoDaemon = null;
+let servoReady = false;
+let servoCallbacks = new Map(); // pending response callbacks keyed by seq id
+let servoSeq = 0;
+let servoBuffer = "";
+
+function startServoDaemon() {
+  servoDaemon = spawn(SERVO_PYTHON, ["-u", SERVO_SCRIPT], {
+    env: { ...process.env, PYTHONUNBUFFERED: "1" },
+  });
+
+  servoDaemon.stdout.on("data", (d) => {
+    servoBuffer += d.toString();
+    const lines = servoBuffer.split("\n");
+    servoBuffer = lines.pop(); // keep incomplete last line
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (trimmed === "READY") {
+        servoReady = true;
+        console.log("[Servo] daemon ready");
+        continue;
+      }
+      // Responses are tagged: "SEQ:<id> OK/ERR ..."
+      const m = trimmed.match(/^SEQ:(\d+)\s+(.*)/);
+      if (m) {
+        const cb = servoCallbacks.get(Number(m[1]));
+        if (cb) { servoCallbacks.delete(Number(m[1])); cb(m[2]); }
+      }
+    }
+  });
+
+  servoDaemon.stderr.on("data", (d) => console.error("[Servo stderr]", d.toString().trim()));
+  servoDaemon.on("error", (err) => console.error("[Servo] spawn error:", err));
+  servoDaemon.on("exit", (code) => {
+    console.log("[Servo] daemon exited with code", code);
+    servoReady = false;
+    servoDaemon = null;
+    // restart after 1s
+    setTimeout(startServoDaemon, 1000);
+  });
+}
+
+function servoCmd(cmd) {
   return new Promise((resolve, reject) => {
-    const py = spawn(SERVO_PYTHON, ["-u", SERVO_SCRIPT, ...args], {
-      env: { ...process.env, PYTHONUNBUFFERED: "1" },
+    if (!servoReady || !servoDaemon) {
+      reject(new Error("Servo daemon not ready"));
+      return;
+    }
+    const id = ++servoSeq;
+    const timeout = setTimeout(() => {
+      servoCallbacks.delete(id);
+      reject(new Error("Servo command timed out"));
+    }, 3000);
+    servoCallbacks.set(id, (response) => {
+      clearTimeout(timeout);
+      resolve(response);
     });
-
-    let stdout = "";
-    let stderr = "";
-
-    py.stdout.on("data", (d) => (stdout += d.toString()));
-    py.stderr.on("data", (d) => (stderr += d.toString()));
-
-    py.on("error", (err) => {
-      reject(new Error(`Failed to start servo python: ${err.message}`));
-    });
-
-    py.on("close", (code) => {
-      resolve({
-        code,
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
-      });
-    });
+    servoDaemon.stdin.write(`SEQ:${id} ${cmd}\n`);
   });
 }
 
@@ -170,15 +213,21 @@ app.use((req, res, next) => {
 
 // set initial state
 writeRelayState("OFF");
-writeServoState(90, 90);
+writeServoState(SERVO_CENTER, SERVO_CENTER);
+startServoDaemon();
 
 async function initServos() {
+  // Wait for daemon to be ready
+  await new Promise((resolve) => {
+    const check = () => servoReady ? resolve() : setTimeout(check, 100);
+    check();
+  });
   try {
     await Promise.all([
-      runServoPython(["90", String(SERVO_H_CHANNEL)]),
-      runServoPython(["90", String(SERVO_V_CHANNEL)])
+      servoCmd(`SET ${SERVO_H_CHANNEL} ${SERVO_CENTER}`),
+      servoCmd(`SET ${SERVO_V_CHANNEL} ${SERVO_CENTER}`)
     ]);
-    console.log("Servos initialized to 90°");
+    console.log(`[Servo] initialized to ${SERVO_CENTER}°`);
   } catch (e) {
     console.error("Failed to initialize servos:", e);
   }
@@ -219,17 +268,17 @@ app.get("/cicka", async (req, res) => {
 app.get("/servo", async (req, res) => {
   const dir = String(req.query.dir || "").toLowerCase();
   const state = readServoState();
-  
+
   if (!["up", "down", "left", "right", "off"].includes(dir)) {
     res.status(400).type("text").send(`Invalid direction. Use: up, down, left, right, off\nCurrent: H=${state.horizontal}° V=${state.vertical}°\n`);
     return;
   }
-  
+
   if (dir === "off") {
     try {
       await Promise.all([
-        runServoPython(["off", String(SERVO_H_CHANNEL)]),
-        runServoPython(["off", String(SERVO_V_CHANNEL)])
+        servoCmd(`OFF ${SERVO_H_CHANNEL}`),
+        servoCmd(`OFF ${SERVO_V_CHANNEL}`)
       ]);
       res.type("text").send("Servos disabled (PWM off)\n");
     } catch (err) {
@@ -238,42 +287,28 @@ app.get("/servo", async (req, res) => {
     }
     return;
   }
-  
+
   let newH = state.horizontal;
   let newV = state.vertical;
-  
-  if (dir === "left") newH = Math.max(SERVO_MIN, newH - SERVO_STEP);
-  if (dir === "right") newH = Math.min(SERVO_MAX, newH + SERVO_STEP);
+
+  if (dir === "left") newH = Math.min(SERVO_MAX, newH + SERVO_STEP);
+  if (dir === "right") newH = Math.max(SERVO_MIN, newH - SERVO_STEP);
   if (dir === "up") newV = Math.min(SERVO_MAX, newV + SERVO_STEP);
   if (dir === "down") newV = Math.max(SERVO_MIN, newV - SERVO_STEP);
-  
+
+  if (newH === state.horizontal && newV === state.vertical) {
+    res.type("text").send(`H: ${newH}° (limit)\nV: ${newV}° (limit)\n`);
+    return;
+  }
+
   try {
-    const commands = [];
-    const labels = [];
-    
-    if (newH !== state.horizontal) {
-      commands.push(runServoPython([String(newH), String(SERVO_H_CHANNEL)]));
-      labels.push({ name: "H", from: state.horizontal, to: newH });
-    }
-    if (newV !== state.vertical) {
-      commands.push(runServoPython([String(newV), String(SERVO_V_CHANNEL)]));
-      labels.push({ name: "V", from: state.vertical, to: newV });
-    }
-    
-    if (commands.length === 0) {
-      res.type("text").send(`H: ${newH}° (limit reached)\nV: ${newV}° (limit reached)\n`);
-      return;
-    }
-    
-    const results = await Promise.all(commands);
+    const cmds = [];
+    if (newH !== state.horizontal) cmds.push(servoCmd(`SET ${SERVO_H_CHANNEL} ${newH}`));
+    if (newV !== state.vertical) cmds.push(servoCmd(`SET ${SERVO_V_CHANNEL} ${newV}`));
+
+    await Promise.all(cmds);
     writeServoState(newH, newV);
-    
-    let output = "";
-    for (let i = 0; i < labels.length; i++) {
-      const l = labels[i];
-      output += `${l.name}: ${l.from}° → ${l.to}°\n${textResponse(results[i])}\n`;
-    }
-    res.type("text").send(output);
+    res.type("text").send(`H: ${state.horizontal}° → ${newH}°\nV: ${state.vertical}° → ${newV}°\n`);
   } catch (err) {
     console.error(err);
     res.status(500).type("text").send(`Node error:\n${err.message}\n`);
@@ -286,19 +321,219 @@ app.get("/servo/status", (_req, res) => {
   res.type("text").send(`H: ${state.horizontal}° V: ${state.vertical}°\n`);
 });
 
-// API: /servo/center - reset to 90°
+// API: /servo/center
 app.get("/servo/center", async (_req, res) => {
   try {
-    const [hResult, vResult] = await Promise.all([
-      runServoPython(["90", String(SERVO_H_CHANNEL)]),
-      runServoPython(["90", String(SERVO_V_CHANNEL)])
+    await Promise.all([
+      servoCmd(`SET ${SERVO_H_CHANNEL} ${SERVO_CENTER}`),
+      servoCmd(`SET ${SERVO_V_CHANNEL} ${SERVO_CENTER}`)
     ]);
-    writeServoState(90, 90);
-    res.type("text").send(`Centered: H=90° V=90°\n${textResponse(hResult)}${textResponse(vResult)}`);
+    writeServoState(SERVO_CENTER, SERVO_CENTER);
+    res.type("text").send(`Centered: H=${SERVO_CENTER}° V=${SERVO_CENTER}°\n`);
   } catch (err) {
     console.error(err);
     res.status(500).type("text").send(`Node error:\n${err.message}\n`);
   }
+});
+
+// API: /servo/dance  — Johnny Five boogies to a rhythm
+let danceActive = false;
+
+app.get("/servo/dance", async (_req, res) => {
+  if (danceActive) {
+    res.status(409).type("text").send("Already dancing!\n");
+    return;
+  }
+  danceActive = true;
+
+  // Spawn one beep.py note and return a Promise that resolves when aplay exits.
+  // This takes exactly duration_ms of wall-clock time — the audio IS the timer.
+  function playNote(note, durationMs) {
+    return new Promise((resolve) => {
+      const proc = spawn("python3", ["-u", BEEP_SCRIPT, note, String(durationMs), "80"], {
+        env: { ...process.env, PYTHONUNBUFFERED: "1" },
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      proc.stderr.on("data", (d) => console.error("[Dance/beep]", d.toString().trim()));
+      proc.on("error", (e) => { console.error("[Dance/beep] spawn error:", e); resolve(); });
+      proc.on("exit", resolve);
+    });
+  }
+
+  // Move both servos and return a Promise that resolves when the daemon ACKs.
+  function moveServo(h, v) {
+    h = Math.max(SERVO_MIN, Math.min(SERVO_MAX, h));
+    v = Math.max(SERVO_MIN, Math.min(SERVO_MAX, v));
+    writeServoState(h, v);
+    return Promise.all([
+      servoCmd(`SET ${SERVO_H_CHANNEL} ${h}`),
+      servoCmd(`SET ${SERVO_V_CHANNEL} ${v}`),
+    ]);
+  }
+
+  // ---- Unified timeline ----
+  // Each step: [note, h, v, duration_ms]
+  // servo move + note play are started simultaneously with Promise.all —
+  // the step ends when BOTH the servo ACKs AND the note finishes playing.
+  // Because aplay blocks for exactly duration_ms, audio is the clock.
+  //
+  // Positions: C=center(135), L=left(165), R=right(105), U=up(160), D=down(110)
+  // BPM 120 → Q=500ms  E=250ms  S=125ms
+  const C = 135, L = 165, R = 105, U = 160, D = 110;
+  const Q = 500, E = 250, S = 125;
+
+  // note, h,  v,  ms
+  const steps = [
+    // ---- Bar 1: head-bob left-right ----
+    ["E",  L, C, E], ["G",  R, C, E], ["A",  L, C, E], ["B",  R, C, E],
+    ["A",  L, C, E], ["G",  R, C, E], ["E",  C, C, Q],
+    ["R",  C, C, E],
+    // ---- Bar 2: nod up-down ----
+    ["D",  C, U, E], ["E",  C, D, E], ["G",  C, U, E], ["E",  C, D, Q],
+    ["D",  C, U, E], ["C",  C, D, Q],
+    ["R",  C, C, E],
+    // ---- Bar 3: diagonal shimmy ----
+    ["C",  L, U, S], ["D",  R, D, S], ["E",  L, U, S], ["G",  R, D, S],
+    ["A",  L, D, S], ["B",  R, U, S], ["A",  L, D, S], ["G",  R, U, S],
+    ["F#", C, C, Q], ["E",  C, C, Q],
+    // ---- Bar 4: fast stutter shake ----
+    ["E",  L, C, S], ["E",  C, C, S], ["G",  R, C, S], ["G",  C, C, S],
+    ["A",  L, C, S], ["A",  C, C, S], ["B",  R, C, S], ["B",  C, C, S],
+    ["A",  L, C, S], ["A",  C, C, S], ["G",  R, C, S], ["G",  C, C, S],
+    ["E",  L, C, S], ["E",  C, C, S], ["D",  R, C, S], ["D",  C, C, S],
+    // ---- Bar 5: full-circle sweep ----
+    ["C",  L, U, E], ["D",  C, U, E], ["E",  R, U, E],
+    ["G",  R, C, E], ["A",  R, D, E],
+    ["G",  C, D, E], ["E",  L, D, E],
+    ["D",  L, C, E],
+    // ---- Bar 6: victory wiggle ----
+    ["E",  L, U, S], ["G",  R, D, S], ["E",  L, U, S], ["G",  R, D, S],
+    ["A",  L, U, S], ["B",  R, D, S], ["A",  L, U, S], ["B",  R, D, S],
+    // ---- Finale: snap to center ----
+    ["E",  C, C, Q], ["R",  C, C, Q],
+  ];
+
+  try {
+    for (const [note, h, v, ms] of steps) {
+      await Promise.all([moveServo(h, v), playNote(note, ms)]);
+    }
+    res.type("text").send("Dance complete!\n");
+  } catch (err) {
+    console.error("[Dance] error:", err);
+    res.status(500).type("text").send(`Node error:\n${err.message}\n`);
+  } finally {
+    danceActive = false;
+  }
+});
+
+// -------------------- Tracker --------------------
+let trackerProcess  = null;
+let trackerReady    = false;
+let trackerBuffer   = "";
+
+function stopTracker() {
+  if (trackerProcess) {
+    trackerProcess.kill("SIGTERM");
+    trackerProcess = null;
+    trackerReady   = false;
+    trackerBuffer  = "";
+  }
+}
+
+// API: /tracker?action=start|stop|status
+app.get("/tracker", async (req, res) => {
+  const action = String(req.query.action || "status").toLowerCase();
+
+  if (action === "status") {
+    res.type("text").send(`Tracker: ${trackerReady ? "running" : "stopped"}\n`);
+    return;
+  }
+
+  if (action === "stop") {
+    stopTracker();
+    res.type("text").send("Tracker stopped\n");
+    return;
+  }
+
+  if (action === "start") {
+    if (trackerReady) {
+      res.type("text").send("Tracker already running\n");
+      return;
+    }
+
+    // Tracker reads from the MJPEG stream — camera must be running first
+    const camPid = readCameraPid();
+    if (!isProcessRunning(camPid)) {
+      res.status(409).type("text").send("Camera is not running. Start the camera first.\n");
+      return;
+    }
+
+    trackerProcess = spawn("python3", ["-u", TRACKER_SCRIPT], {
+      env: { ...process.env, PYTHONUNBUFFERED: "1" },
+    });
+
+    trackerProcess.stderr.on("data", (d) =>
+      console.error("[Tracker stderr]", d.toString().trim())
+    );
+
+    trackerProcess.stdout.on("data", (d) => {
+      trackerBuffer += d.toString();
+      const lines = trackerBuffer.split("\n");
+      trackerBuffer = lines.pop();
+
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (!line) continue;
+
+        if (line === "READY") {
+          trackerReady = true;
+          console.log("[Tracker] ready");
+          continue;
+        }
+
+        if (line === "LOST") continue;  // nothing to do
+
+        const m = line.match(/^MOVE (-?\d+)$/);
+        if (m && trackerReady && servoReady) {
+          const delta = parseInt(m[1], 10);
+          const state = readServoState();
+          const newH  = Math.max(SERVO_MIN, Math.min(SERVO_MAX, state.horizontal + delta));
+          if (newH !== state.horizontal) {
+            writeServoState(newH, state.vertical);
+            servoCmd(`SET ${SERVO_H_CHANNEL} ${newH}`).catch((e) =>
+              console.error("[Tracker] servo error:", e)
+            );
+          }
+        }
+      }
+    });
+
+    trackerProcess.on("error", (e) => console.error("[Tracker] spawn error:", e));
+    trackerProcess.on("exit", (code) => {
+      console.log("[Tracker] exited with code", code);
+      trackerProcess = null;
+      trackerReady   = false;
+      trackerBuffer  = "";
+    });
+
+    // Wait up to 5 s for READY
+    const started = await new Promise((resolve) => {
+      const deadline = setTimeout(() => resolve(false), 15000);
+      const check    = setInterval(() => {
+        if (trackerReady) { clearInterval(check); clearTimeout(deadline); resolve(true); }
+      }, 100);
+    });
+
+    if (started) {
+      res.type("text").send("Tracker started\n");
+    } else {
+      stopTracker();
+      res.status(500).type("text").send("Tracker failed to start (timeout)\n");
+    }
+    return;
+  }
+
+  res.status(400).type("text").send("Invalid action. Use: start, stop, status\n");
 });
 
 let cameraProcess = null;
@@ -371,6 +606,7 @@ app.get("/camera", (req, res) => {
       "--width", String(preset.width),
       "--height", String(preset.height),
       "--framerate", String(preset.fps),
+      "--autofocus-mode", "continuous",
       "-o", "-"
     ], { stdio: ["ignore", "pipe", "pipe"] });
 
@@ -570,8 +806,61 @@ app.get("/ui", (_req, res) => {
       grid-template-columns: repeat(3, 50px);
       grid-template-rows: repeat(3, 50px);
       gap: 5px;
-      margin: 15px auto;
       justify-content: center;
+    }
+    .controls-row {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 10px 0;
+    }
+    .fire-group {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+    }
+    .fire-btn {
+      width: 70px;
+      height: 70px;
+      font-size: 13px;
+      font-family: "Luckiest Guy", system-ui, sans-serif;
+      border-radius: 10px;
+      border: 3px solid #000;
+      cursor: not-allowed;
+      background: #333;
+      color: #666;
+      box-shadow: 0 4px 0 #000;
+      transition: background 0.15s, color 0.15s, transform 0.05s;
+    }
+    .fire-btn.armed {
+      background: var(--red);
+      color: #fff;
+      cursor: pointer;
+      animation: pulse-glow 1s infinite;
+    }
+    .fire-btn.armed:active {
+      transform: translateY(4px);
+      box-shadow: 0 0 0 #000;
+    }
+    @keyframes pulse-glow {
+      0%, 100% { box-shadow: 0 4px 0 #000, 0 0 0px rgba(229,57,53,0); }
+      50% { box-shadow: 0 4px 0 #000, 0 0 14px rgba(229,57,53,0.8); }
+    }
+    .fire-label {
+      font-size: 10px;
+      color: rgba(255,255,255,0.5);
+      text-align: center;
+    }
+    .ms-input {
+      width: 54px;
+      font-size: 12px;
+      padding: 4px;
+      border-radius: 6px;
+      border: 2px solid #000;
+      text-align: center;
     }
     .arrow-btn {
       width: 50px;
@@ -683,6 +972,58 @@ app.get("/ui", (_req, res) => {
       cursor: pointer;
     }
     .hidden { display: none !important; }
+    .dance-btn {
+      background: linear-gradient(135deg, #ff6ec7, #ff9500, #ffe600, #00e0ff);
+      background-size: 300% 300%;
+      color: #000;
+      font-size: 18px;
+      padding: 12px 22px;
+      border-radius: 14px;
+      border: 3px solid #000;
+      cursor: pointer;
+      box-shadow: 0 4px 0 #000;
+      transition: transform 0.05s ease, box-shadow 0.05s ease;
+      animation: rainbow-shift 2s linear infinite;
+    }
+    .dance-btn:active {
+      transform: translateY(4px);
+      box-shadow: 0 0 0 #000;
+    }
+    .dance-btn.dancing {
+      animation: rainbow-shift 0.4s linear infinite, jiggle 0.15s ease-in-out infinite;
+      cursor: not-allowed;
+    }
+    @keyframes rainbow-shift {
+      0%   { background-position: 0% 50%; }
+      50%  { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+    @keyframes jiggle {
+      0%   { transform: rotate(-4deg) scale(1.04); }
+      50%  { transform: rotate( 4deg) scale(1.04); }
+      100% { transform: rotate(-4deg) scale(1.04); }
+    }
+    .track-btn {
+      background: #555;
+      color: #aaa;
+      font-size: 15px;
+      padding: 12px 18px;
+      border-radius: 14px;
+      border: 3px solid #000;
+      cursor: pointer;
+      box-shadow: 0 4px 0 #000;
+      transition: background 0.2s, color 0.2s, transform 0.05s;
+    }
+    .track-btn:active { transform: translateY(4px); box-shadow: 0 0 0 #000; }
+    .track-btn.tracking {
+      background: #00e0a0;
+      color: #000;
+      animation: tracking-pulse 1.2s ease-in-out infinite;
+    }
+    @keyframes tracking-pulse {
+      0%, 100% { box-shadow: 0 4px 0 #000, 0 0 0px rgba(0,224,160,0); }
+      50%       { box-shadow: 0 4px 0 #000, 0 0 16px rgba(0,224,160,0.7); }
+    }
   </style>
 </head>
 <body>
@@ -719,30 +1060,37 @@ app.get("/ui", (_req, res) => {
         <div class="crosshair-circle"></div>
       </div>
       
-      <div class="arrow-pad">
-        <div class="arrow-btn empty"></div>
-        <button class="arrow-btn" id="aimUp">▲</button>
-        <div class="arrow-btn empty"></div>
-        <button class="arrow-btn" id="aimLeft">◀</button>
-        <button class="arrow-btn" id="aimCenter" style="font-size:18px;background:var(--green);">⊙</button>
-        <button class="arrow-btn" id="aimRight">▶</button>
-        <div class="arrow-btn empty"></div>
-        <button class="arrow-btn" id="aimDown">▼</button>
-        <button class="arrow-btn" id="aimOff" style="font-size:14px;background:var(--red);">OFF</button>
+      <div class="controls-row">
+        <div class="arrow-pad">
+          <div class="arrow-btn empty"></div>
+          <button class="arrow-btn" id="aimUp">▲</button>
+          <div class="arrow-btn empty"></div>
+          <button class="arrow-btn" id="aimLeft">◀</button>
+          <button class="arrow-btn" id="aimCenter" style="font-size:18px;background:var(--green);">⊙</button>
+          <button class="arrow-btn" id="aimRight">▶</button>
+          <div class="arrow-btn empty"></div>
+          <button class="arrow-btn" id="aimDown">▼</button>
+          <div class="arrow-btn empty"></div>
+        </div>
+
+        <div class="fire-group">
+          <button class="fire-btn armed" id="fireBtn">FIRE</button>
+          <div class="fire-label">
+            <input class="ms-input" id="ms" type="number" min="50" max="5000" value="500">
+            <span>ms</span>
+          </div>
+        </div>
+
+        <div class="fire-group">
+          <button class="dance-btn" id="danceBtn">💃 DANCE</button>
+        </div>
+
+        <div class="fire-group">
+          <button class="track-btn" id="trackBtn">🎯 TRACK</button>
+        </div>
       </div>
     </div>
     <div id="cameraOut" class="out-box"></div>
-  </div>
-
-  <div class="small-card">
-    <h3>🎯 Airgun Relay</h3>
-    <div class="row">
-      <input id="ms" type="number" min="50" max="5000" value="500" style="width:60px;font-size:12px;padding:4px;border-radius:6px;border:2px solid #000;text-align:center;">
-      <button class="blue" id="pulseBtn">PULSE</button>
-      <button class="green" id="onBtn">ON</button>
-      <button class="red" id="offBtn">OFF</button>
-    </div>
-    <div id="out" class="out-box">Ready.</div>
   </div>
 
   <div id="iosFullscreen">
@@ -752,37 +1100,70 @@ app.get("/ui", (_req, res) => {
 
   <script>
     const apiBase = () => location.protocol + "//" + location.hostname + ":3000";
-    
-    const out = document.getElementById("out");
+
     const msInput = document.getElementById("ms");
     const cameraOut = document.getElementById("cameraOut");
-    const cameraStatus = document.getElementById("cameraStatus");
     const cameraStartBtn = document.getElementById("cameraStartBtn");
     const cameraStopBtn = document.getElementById("cameraStopBtn");
     const videoStream = document.getElementById("videoStream");
     const fullscreenBtn = document.getElementById("fullscreenBtn");
     const qualitySelect = document.getElementById("qualitySelect");
     const connectionQuality = document.getElementById("connectionQuality");
+    const fireBtn = document.getElementById("fireBtn");
 
     let detectedQuality = "low";
 
-    async function call(path) {
-      const url = apiBase() + path;
-      out.textContent = "...";
+    function doFire() {
+      const ms = Math.max(50, Math.min(Number(msInput.value || 500), 5000));
+      fetch(apiBase() + "/cicka?mode=pulse&ms=" + ms, { cache: "no-store" }).catch(console.error);
+    }
+
+    fireBtn.addEventListener("click", doFire);
+
+    const danceBtn = document.getElementById("danceBtn");
+
+    async function doDance() {
+      if (danceBtn.classList.contains("dancing")) return;
+      danceBtn.classList.add("dancing");
+      danceBtn.textContent = "🕺 DANCING...";
       try {
-        const r = await fetch(url, { cache: "no-store" });
-        out.textContent = await r.text();
+        const res = await fetch(apiBase() + "/servo/dance", { cache: "no-store" });
+        const text = await res.text();
+        cameraOut.textContent = text;
       } catch (e) {
-        out.textContent = "Error: " + e;
+        cameraOut.textContent = "Dance error: " + e;
+      } finally {
+        danceBtn.classList.remove("dancing");
+        danceBtn.textContent = "💃 DANCE";
       }
     }
 
-    document.getElementById("pulseBtn").addEventListener("click", () => {
-      const ms = Math.max(50, Math.min(Number(msInput.value || 500), 5000));
-      call("/cicka?mode=pulse&ms=" + ms);
-    });
-    document.getElementById("onBtn").addEventListener("click", () => call("/cicka?mode=on"));
-    document.getElementById("offBtn").addEventListener("click", () => call("/cicka?mode=off"));
+    danceBtn.addEventListener("click", doDance);
+
+    // ---- Tracker ----
+    const trackBtn = document.getElementById("trackBtn");
+    let tracking = false;
+
+    async function toggleTrack() {
+      const action = tracking ? "stop" : "start";
+      trackBtn.disabled = true;
+      try {
+        const res = await fetch(apiBase() + "/tracker?action=" + action, { cache: "no-store" });
+        const text = await res.text();
+        if (res.ok) {
+          tracking = !tracking;
+          trackBtn.classList.toggle("tracking", tracking);
+          trackBtn.textContent = tracking ? "🎯 TRACKING..." : "🎯 TRACK";
+        }
+        cameraOut.textContent = text.trim();
+      } catch (e) {
+        cameraOut.textContent = "Tracker error: " + e;
+      } finally {
+        trackBtn.disabled = false;
+      }
+    }
+
+    trackBtn.addEventListener("click", toggleTrack);
 
     async function moveServo(dir) {
       const url = apiBase() + "/servo?dir=" + dir;
@@ -805,7 +1186,27 @@ app.get("/ui", (_req, res) => {
     document.getElementById("aimLeft").addEventListener("click", () => moveServo("left"));
     document.getElementById("aimRight").addEventListener("click", () => moveServo("right"));
     document.getElementById("aimCenter").addEventListener("click", centerServo);
-    document.getElementById("aimOff").addEventListener("click", () => moveServo("off"));
+
+    // ---- Keyboard arrow control (hold to repeat) + Space to fire ----
+    const KEY_DIRS = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
+    const heldKeys = {};
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === " ") { e.preventDefault(); if (!e.repeat) doFire(); return; }
+      const dir = KEY_DIRS[e.key];
+      if (!dir) return;
+      e.preventDefault();
+      if (heldKeys[e.key]) return;
+      moveServo(dir);
+      heldKeys[e.key] = setInterval(() => moveServo(dir), 150);
+    });
+
+    document.addEventListener("keyup", (e) => {
+      const dir = KEY_DIRS[e.key];
+      if (!dir) return;
+      clearInterval(heldKeys[e.key]);
+      delete heldKeys[e.key];
+    });
 
     async function testConnectionQuality() {
       connectionQuality.textContent = "Testing...";

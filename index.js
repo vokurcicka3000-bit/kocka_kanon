@@ -78,7 +78,7 @@ const PORT = 3000;
 const SCRIPT = path.join(__dirname, "scripts", "relecko.py");
 const SERVO_SCRIPT = path.join(__dirname, "scripts", "servo.py");
 const BEEP_SCRIPT    = path.join(__dirname, "scripts", "beep.py");
-const TRACKER_SCRIPT = path.join(__dirname, "scripts", "tracker.py");
+const MOTION_ALERT_SCRIPT = path.join(__dirname, "scripts", "motion_alert.py");
 const SERVO_PYTHON = path.join(__dirname, "scripts", "servo-env", "bin", "python");
 const MODES = new Set(["on", "off", "pulse"]);
 const PULSE_MIN_MS = 50;
@@ -90,6 +90,7 @@ const SERVO_MAX = 270;
 const SERVO_CENTER = 135;
 const SERVO_H_CHANNEL = 0;
 const SERVO_V_CHANNEL = 1;
+const SERVO_V_SETTLE_MS = 500; // ms to hold position before cutting PWM on vertical servo
 
 // -------------------- Helpers --------------------
 function clampInt(value, min, max, fallback) {
@@ -139,7 +140,22 @@ function runPython(scriptPath, args = []) {
   });
 }
 
-// -------------------- Servo daemon --------------------
+// Sends SET for the given channel, then schedules an OFF after SERVO_V_SETTLE_MS for
+// the vertical channel so it holds its position briefly and then relaxes (no idle jitter).
+// The delayed OFF is fire-and-forget; a newer move cancels the pending OFF via the timer ref.
+const servoVOffTimer = { ref: null };
+function servoSetCmd(channel, angle) {
+  if (channel !== SERVO_V_CHANNEL) return `SET ${channel} ${angle}`;
+  // Cancel any pending OFF from a previous move, then re-arm after this move resolves.
+  if (servoVOffTimer.ref) { clearTimeout(servoVOffTimer.ref); servoVOffTimer.ref = null; }
+  servoVOffTimer.ref = setTimeout(() => {
+    servoVOffTimer.ref = null;
+    servoCmd(`OFF ${SERVO_V_CHANNEL}`).catch((e) => console.error("[Servo] delayed OFF error:", e));
+  }, SERVO_V_SETTLE_MS);
+  return `SET ${channel} ${angle}`;
+}
+
+
 // Single persistent process - avoids set_pwm_freq() glitch on every call.
 let servoDaemon = null;
 let servoReady = false;
@@ -225,7 +241,7 @@ async function initServos() {
   try {
     await Promise.all([
       servoCmd(`SET ${SERVO_H_CHANNEL} ${SERVO_CENTER}`),
-      servoCmd(`SET ${SERVO_V_CHANNEL} ${SERVO_CENTER}`)
+      servoCmd(servoSetCmd(SERVO_V_CHANNEL, SERVO_CENTER))
     ]);
     console.log(`[Servo] initialized to ${SERVO_CENTER}°`);
   } catch (e) {
@@ -304,7 +320,7 @@ app.get("/servo", async (req, res) => {
   try {
     const cmds = [];
     if (newH !== state.horizontal) cmds.push(servoCmd(`SET ${SERVO_H_CHANNEL} ${newH}`));
-    if (newV !== state.vertical) cmds.push(servoCmd(`SET ${SERVO_V_CHANNEL} ${newV}`));
+    if (newV !== state.vertical) cmds.push(servoCmd(servoSetCmd(SERVO_V_CHANNEL, newV)));
 
     await Promise.all(cmds);
     writeServoState(newH, newV);
@@ -326,7 +342,7 @@ app.get("/servo/center", async (_req, res) => {
   try {
     await Promise.all([
       servoCmd(`SET ${SERVO_H_CHANNEL} ${SERVO_CENTER}`),
-      servoCmd(`SET ${SERVO_V_CHANNEL} ${SERVO_CENTER}`)
+      servoCmd(servoSetCmd(SERVO_V_CHANNEL, SERVO_CENTER))
     ]);
     writeServoState(SERVO_CENTER, SERVO_CENTER);
     res.type("text").send(`Centered: H=${SERVO_CENTER}° V=${SERVO_CENTER}°\n`);
@@ -367,7 +383,7 @@ app.get("/servo/dance", async (_req, res) => {
     writeServoState(h, v);
     return Promise.all([
       servoCmd(`SET ${SERVO_H_CHANNEL} ${h}`),
-      servoCmd(`SET ${SERVO_V_CHANNEL} ${v}`),
+      servoCmd(servoSetCmd(SERVO_V_CHANNEL, v)),
     ]);
   }
 
@@ -426,112 +442,102 @@ app.get("/servo/dance", async (_req, res) => {
   }
 });
 
-// -------------------- Tracker --------------------
-let trackerProcess  = null;
-let trackerReady    = false;
-let trackerBuffer   = "";
+// -------------------- Motion Alert --------------------
+let motionAlertProcess = null;
+let motionAlertReady   = false;
+let motionAlertBuffer  = "";
 
-function stopTracker() {
-  if (trackerProcess) {
-    trackerProcess.kill("SIGTERM");
-    trackerProcess = null;
-    trackerReady   = false;
-    trackerBuffer  = "";
+function stopMotionAlert() {
+  if (motionAlertProcess) {
+    motionAlertProcess.kill("SIGTERM");
+    motionAlertProcess = null;
+    motionAlertReady   = false;
+    motionAlertBuffer  = "";
   }
 }
 
-// API: /tracker?action=start|stop|status
-app.get("/tracker", async (req, res) => {
+// API: /motion-alert?action=start|stop|status
+// Optional query params for start: token=<bot_token>&chat_id=<chat_id>
+app.get("/motion-alert", async (req, res) => {
   const action = String(req.query.action || "status").toLowerCase();
 
   if (action === "status") {
-    res.type("text").send(`Tracker: ${trackerReady ? "running" : "stopped"}\n`);
+    res.type("text").send(`Motion alert: ${motionAlertReady ? "running" : "stopped"}\n`);
     return;
   }
 
   if (action === "stop") {
-    stopTracker();
-    res.type("text").send("Tracker stopped\n");
+    stopMotionAlert();
+    res.type("text").send("Motion alert stopped\n");
     return;
   }
 
   if (action === "start") {
-    if (trackerReady) {
-      res.type("text").send("Tracker already running\n");
+    if (motionAlertReady) {
+      res.type("text").send("Motion alert already running\n");
       return;
     }
 
-    // Tracker reads from the MJPEG stream — camera must be running first
     const camPid = readCameraPid();
     if (!isProcessRunning(camPid)) {
       res.status(409).type("text").send("Camera is not running. Start the camera first.\n");
       return;
     }
 
-    trackerProcess = spawn("python3", ["-u", TRACKER_SCRIPT, "--mode", String(req.query.mode || "face")], {
-      env: { ...process.env, PYTHONUNBUFFERED: "1" },
+    const token  = String(req.query.token   || process.env.TELEGRAM_TOKEN   || "");
+    const chatId = String(req.query.chat_id || process.env.TELEGRAM_CHAT_ID || "");
+
+    motionAlertProcess = spawn("python3", ["-u", MOTION_ALERT_SCRIPT], {
+      env: {
+        ...process.env,
+        PYTHONUNBUFFERED:  "1",
+        TELEGRAM_TOKEN:    token,
+        TELEGRAM_CHAT_ID:  chatId,
+      },
     });
 
-    trackerProcess.stderr.on("data", (d) =>
-      console.error("[Tracker stderr]", d.toString().trim())
+    motionAlertProcess.stderr.on("data", (d) =>
+      console.error("[MotionAlert stderr]", d.toString().trim())
     );
 
-    trackerProcess.stdout.on("data", (d) => {
-      trackerBuffer += d.toString();
-      const lines = trackerBuffer.split("\n");
-      trackerBuffer = lines.pop();
+    motionAlertProcess.stdout.on("data", (d) => {
+      motionAlertBuffer += d.toString();
+      const lines = motionAlertBuffer.split("\n");
+      motionAlertBuffer = lines.pop();
 
       for (const raw of lines) {
         const line = raw.trim();
         if (!line) continue;
-
         if (line === "READY") {
-          trackerReady = true;
-          console.log("[Tracker] ready");
-          continue;
-        }
-
-        if (line === "LOST") continue;  // nothing to do
-
-        const m = line.match(/^MOVE (-?\d+)(?: (-?\d+))?$/);
-        if (m && trackerReady && servoReady) {
-          const dH    = parseInt(m[1], 10);
-          const dV    = m[2] !== undefined ? parseInt(m[2], 10) : 0;
-          const state = readServoState();
-          const newH  = Math.max(SERVO_MIN, Math.min(SERVO_MAX, state.horizontal + dH));
-          const newV  = Math.max(SERVO_MIN, Math.min(SERVO_MAX, state.vertical   + dV));
-          const cmds  = [];
-          if (newH !== state.horizontal) cmds.push(servoCmd(`SET ${SERVO_H_CHANNEL} ${newH}`));
-          if (newV !== state.vertical)   cmds.push(servoCmd(`SET ${SERVO_V_CHANNEL} ${newV}`));
-          if (cmds.length) {
-            writeServoState(newH, newV);
-            Promise.all(cmds).catch((e) => console.error("[Tracker] servo error:", e));
-          }
+          motionAlertReady = true;
+          console.log("[MotionAlert] ready");
+        } else if (line === "MOTION") {
+          console.log("[MotionAlert] motion detected");
         }
       }
     });
 
-    trackerProcess.on("error", (e) => console.error("[Tracker] spawn error:", e));
-    trackerProcess.on("exit", (code) => {
-      console.log("[Tracker] exited with code", code);
-      trackerProcess = null;
-      trackerReady   = false;
-      trackerBuffer  = "";
+    motionAlertProcess.on("error", (e) => console.error("[MotionAlert] spawn error:", e));
+    motionAlertProcess.on("exit", (code) => {
+      console.log("[MotionAlert] exited with code", code);
+      motionAlertProcess = null;
+      motionAlertReady   = false;
+      motionAlertBuffer  = "";
     });
 
-    // Wait up to 5 s for READY
+    // Wait up to 15 s for READY
     const started = await new Promise((resolve) => {
       const deadline = setTimeout(() => resolve(false), 15000);
       const check    = setInterval(() => {
-        if (trackerReady) { clearInterval(check); clearTimeout(deadline); resolve(true); }
+        if (motionAlertReady) { clearInterval(check); clearTimeout(deadline); resolve(true); }
       }, 100);
     });
 
     if (started) {
-      res.type("text").send("Tracker started\n");
+      res.type("text").send("Motion alert started\n");
     } else {
-      stopTracker();
-      res.status(500).type("text").send("Tracker failed to start (timeout)\n");
+      stopMotionAlert();
+      res.status(500).type("text").send("Motion alert failed to start (timeout)\n");
     }
     return;
   }
@@ -759,41 +765,11 @@ app.get("/ui", (_req, res) => {
       border: 3px solid #000;
       background: #000;
     }
-    .crosshair {
+    .crosshair-canvas {
       position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      pointer-events: none;
-    }
-    .crosshair::before, .crosshair::after {
-      content: '';
-      position: absolute;
-      background: rgba(255,0,0,0.8);
-    }
-    .crosshair::before {
-      width: 2px;
-      height: 40px;
-      left: 50%;
-      top: 50%;
-      transform: translate(-50%, -50%);
-    }
-    .crosshair::after {
-      width: 40px;
-      height: 2px;
-      left: 50%;
-      top: 50%;
-      transform: translate(-50%, -50%);
-    }
-    .crosshair-circle {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      width: 60px;
-      height: 60px;
-      border: 2px solid rgba(255,0,0,0.8);
-      border-radius: 50%;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      border-radius: 10px;
       pointer-events: none;
     }
     .camera-row {
@@ -808,33 +784,38 @@ app.get("/ui", (_req, res) => {
       font-size: 12px;
       opacity: 0.8;
     }
-    .aim-panel {
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      gap: 24px;
-      margin: 12px 0;
-    }
-    .fire-panel {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 8px;
-    }
     .actions-bar {
       display: flex;
       justify-content: center;
       align-items: center;
       gap: 16px;
       flex-wrap: wrap;
-      margin: 6px 0 4px;
+      margin: 12px 0 4px;
     }
-    .track-group {
+    .alert-group {
       display: flex;
       flex-direction: column;
       align-items: center;
       gap: 6px;
     }
+    .alert-cfg {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 11px;
+      color: rgba(255,255,255,0.7);
+    }
+    .alert-cfg input {
+      font-family: monospace;
+      font-size: 11px;
+      padding: 4px 6px;
+      border-radius: 6px;
+      border: 2px solid #000;
+      background: rgba(255,255,255,0.15);
+      color: #fff;
+      width: 200px;
+    }
+    .alert-cfg input::placeholder { color: rgba(255,255,255,0.35); }
     .arrow-pad {
       display: grid;
       grid-template-columns: repeat(3, 50px);
@@ -842,65 +823,6 @@ app.get("/ui", (_req, res) => {
       gap: 5px;
       justify-content: center;
     }
-    .fire-btn {
-      width: 70px;
-      height: 70px;
-      font-size: 13px;
-      font-family: "Luckiest Guy", system-ui, sans-serif;
-      border-radius: 10px;
-      border: 3px solid #000;
-      cursor: not-allowed;
-      background: #333;
-      color: #666;
-      box-shadow: 0 4px 0 #000;
-      transition: background 0.15s, color 0.15s, transform 0.05s;
-    }
-    .fire-btn.armed {
-      background: var(--red);
-      color: #fff;
-      cursor: pointer;
-      animation: pulse-glow 1s infinite;
-    }
-    .fire-btn.armed:active {
-      transform: translateY(4px);
-      box-shadow: 0 0 0 #000;
-    }
-    @keyframes pulse-glow {
-      0%, 100% { box-shadow: 0 4px 0 #000, 0 0 0px rgba(229,57,53,0); }
-      50% { box-shadow: 0 4px 0 #000, 0 0 14px rgba(229,57,53,0.8); }
-    }
-    .fire-label {
-      font-size: 10px;
-      color: rgba(255,255,255,0.5);
-      text-align: center;
-    }
-    .ms-input {
-      width: 54px;
-      font-size: 12px;
-      padding: 4px;
-      border-radius: 6px;
-      border: 2px solid #000;
-      text-align: center;
-    }
-    .arrow-btn {
-      width: 50px;
-      height: 50px;
-      font-size: 24px;
-      padding: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: var(--blue);
-      color: white;
-      border: 3px solid #000;
-      border-radius: 10px;
-      cursor: pointer;
-    }
-    .arrow-btn:active {
-      transform: scale(0.95);
-      background: #3a7bc8;
-    }
-    .arrow-btn.empty { visibility: hidden; }
     select {
       font-family: "Luckiest Guy", system-ui, sans-serif;
       font-size: 14px;
@@ -972,38 +894,7 @@ app.get("/ui", (_req, res) => {
       cursor: pointer;
     }
     .hidden { display: none !important; }
-    .dance-btn {
-      background: linear-gradient(135deg, #ff6ec7, #ff9500, #ffe600, #00e0ff);
-      background-size: 300% 300%;
-      color: #000;
-      font-size: 18px;
-      padding: 12px 22px;
-      border-radius: 14px;
-      border: 3px solid #000;
-      cursor: pointer;
-      box-shadow: 0 4px 0 #000;
-      transition: transform 0.05s ease, box-shadow 0.05s ease;
-      animation: rainbow-shift 2s linear infinite;
-    }
-    .dance-btn:active {
-      transform: translateY(4px);
-      box-shadow: 0 0 0 #000;
-    }
-    .dance-btn.dancing {
-      animation: rainbow-shift 0.4s linear infinite, jiggle 0.15s ease-in-out infinite;
-      cursor: not-allowed;
-    }
-    @keyframes rainbow-shift {
-      0%   { background-position: 0% 50%; }
-      50%  { background-position: 100% 50%; }
-      100% { background-position: 0% 50%; }
-    }
-    @keyframes jiggle {
-      0%   { transform: rotate(-4deg) scale(1.04); }
-      50%  { transform: rotate( 4deg) scale(1.04); }
-      100% { transform: rotate(-4deg) scale(1.04); }
-    }
-    .track-btn {
+    .alert-btn {
       background: #555;
       color: #aaa;
       font-size: 15px;
@@ -1014,16 +905,114 @@ app.get("/ui", (_req, res) => {
       box-shadow: 0 4px 0 #000;
       transition: background 0.2s, color 0.2s, transform 0.05s;
     }
-    .track-btn:active { transform: translateY(4px); box-shadow: 0 0 0 #000; }
-    .track-btn.tracking {
-      background: #00e0a0;
-      color: #000;
-      animation: tracking-pulse 1.2s ease-in-out infinite;
+    .alert-btn:active { transform: translateY(4px); box-shadow: 0 0 0 #000; }
+    .alert-btn.alerting {
+      background: #e53935;
+      color: #fff;
+      animation: alert-pulse 1.2s ease-in-out infinite;
     }
-    @keyframes tracking-pulse {
-      0%, 100% { box-shadow: 0 4px 0 #000, 0 0 0px rgba(0,224,160,0); }
-      50%       { box-shadow: 0 4px 0 #000, 0 0 16px rgba(0,224,160,0.7); }
+    @keyframes alert-pulse {
+      0%, 100% { box-shadow: 0 4px 0 #000, 0 0 0px rgba(229,57,53,0); }
+      50%       { box-shadow: 0 4px 0 #000, 0 0 16px rgba(229,57,53,0.8); }
     }
+
+    /* ---- D-pad + FIRE ---- */
+    .controls-row {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 32px;
+      margin: 14px 0 6px;
+      flex-wrap: wrap;
+    }
+    .dpad {
+      display: grid;
+      grid-template-columns: repeat(3, 52px);
+      grid-template-rows: repeat(3, 52px);
+      gap: 4px;
+    }
+    .dpad-btn {
+      width: 52px;
+      height: 52px;
+      font-size: 22px;
+      padding: 0;
+      border-radius: 10px;
+      border: 3px solid #000;
+      cursor: pointer;
+      box-shadow: 0 4px 0 #000;
+      transition: transform 0.05s ease;
+      background: #4A90E2;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .dpad-btn:active { transform: translateY(4px); box-shadow: 0 0 0 #000; }
+    .dpad-btn.center-btn {
+      background: rgba(255,255,255,0.1);
+      border-color: rgba(255,255,255,0.3);
+      color: rgba(255,255,255,0.3);
+      cursor: default;
+      box-shadow: none;
+      font-size: 13px;
+    }
+    .dpad-empty { width: 52px; height: 52px; }
+
+    /* Aircraft FIRE button */
+    .fire-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+    }
+    .fire-guard {
+      position: relative;
+      width: 84px;
+      height: 84px;
+    }
+    /* Safety guard arc */
+    .fire-guard::before {
+      content: "";
+      position: absolute;
+      inset: -8px;
+      border-radius: 50%;
+      border: 5px solid #ff9800;
+      border-bottom-color: transparent;
+      border-left-color: transparent;
+      transform: rotate(-45deg);
+      pointer-events: none;
+      box-shadow: 0 0 8px rgba(255,152,0,0.6);
+    }
+    .fire-btn {
+      width: 84px;
+      height: 84px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 35% 35%, #ff5252, #b71c1c);
+      border: 4px solid #000;
+      color: #fff;
+      font-family: "Luckiest Guy", system-ui, sans-serif;
+      font-size: 13px;
+      letter-spacing: 1px;
+      cursor: pointer;
+      box-shadow: 0 6px 0 #7f0000, 0 0 20px rgba(255,82,82,0.5);
+      transition: transform 0.05s ease, box-shadow 0.05s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      line-height: 1.1;
+    }
+    .fire-btn:active {
+      transform: translateY(6px);
+      box-shadow: 0 0 0 #7f0000, 0 0 28px rgba(255,82,82,0.9);
+    }
+    .fire-label {
+      font-size: 10px;
+      color: #ff9800;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+    }
+    .fire-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -1061,42 +1050,41 @@ app.get("/ui", (_req, res) => {
       <!-- Video -->
       <div class="video-wrapper" id="videoWrapper">
         <img id="videoStream" src="">
-        <div class="crosshair"></div>
-        <div class="crosshair-circle"></div>
+        <canvas class="crosshair-canvas" id="crosshairCanvas"></canvas>
       </div>
 
-      <!-- Aim panel: d-pad left, FIRE right -->
-      <div class="aim-panel">
-        <div class="arrow-pad">
-          <div class="arrow-btn empty"></div>
-          <button class="arrow-btn" id="aimUp">▲</button>
-          <div class="arrow-btn empty"></div>
-          <button class="arrow-btn" id="aimLeft">◀</button>
-          <button class="arrow-btn" id="aimCenter" style="font-size:18px;background:var(--green);">⊙</button>
-          <button class="arrow-btn" id="aimRight">▶</button>
-          <div class="arrow-btn empty"></div>
-          <button class="arrow-btn" id="aimDown">▼</button>
-          <div class="arrow-btn empty"></div>
+      <!-- Camera controls: D-pad + FIRE -->
+      <div class="controls-row">
+        <!-- D-pad -->
+        <div class="dpad">
+          <div class="dpad-empty"></div>
+          <button class="dpad-btn" id="dUp"    title="Up (↑)"    onclick="servoDir('up')">▲</button>
+          <div class="dpad-empty"></div>
+          <button class="dpad-btn" id="dLeft"  title="Left (←)"  onclick="servoDir('left')">◀</button>
+          <button class="dpad-btn center-btn"  title="Camera aim">⊕</button>
+          <button class="dpad-btn" id="dRight" title="Right (→)" onclick="servoDir('right')">▶</button>
+          <div class="dpad-empty"></div>
+          <button class="dpad-btn" id="dDown"  title="Down (↓)"  onclick="servoDir('down')">▼</button>
+          <div class="dpad-empty"></div>
         </div>
 
-        <div class="fire-panel">
-          <button class="fire-btn armed" id="fireBtn">FIRE</button>
-          <div class="fire-label">
-            <input class="ms-input" id="ms" type="number" min="50" max="5000" value="500">
-            <span>ms</span>
+        <!-- FIRE button -->
+        <div class="fire-wrap">
+          <div class="fire-guard">
+            <button class="fire-btn" id="fireBtn" onclick="fireCannon()">FIRE</button>
           </div>
+          <span class="fire-label">&#9888; ARMED</span>
         </div>
       </div>
 
-      <!-- Actions bottom bar -->
+      <!-- Actions bar: motion alert -->
       <div class="actions-bar">
-        <button class="dance-btn" id="danceBtn">💃 DANCE</button>
-        <div class="track-group">
-          <button class="track-btn" id="trackBtn">🎯 TRACK</button>
-          <select id="trackMode">
-            <option value="face">Face</option>
-            <option value="motion">Motion</option>
-          </select>
+        <div class="alert-group">
+          <button class="alert-btn" id="alertBtn">🔔 MOTION ALERT</button>
+          <div class="alert-cfg">
+            <input id="tgToken"  type="text" placeholder="Telegram bot token" autocomplete="off" spellcheck="false">
+            <input id="tgChatId" type="text" placeholder="Telegram chat ID"   autocomplete="off" spellcheck="false">
+          </div>
         </div>
       </div>
 
@@ -1113,7 +1101,6 @@ app.get("/ui", (_req, res) => {
   <script>
     const apiBase = () => location.protocol + "//" + location.hostname + ":3000";
 
-    const msInput = document.getElementById("ms");
     const cameraOut = document.getElementById("cameraOut");
     const cameraStartBtn = document.getElementById("cameraStartBtn");
     const cameraStopBtn = document.getElementById("cameraStopBtn");
@@ -1121,108 +1108,51 @@ app.get("/ui", (_req, res) => {
     const fullscreenBtn = document.getElementById("fullscreenBtn");
     const qualitySelect = document.getElementById("qualitySelect");
     const connectionQuality = document.getElementById("connectionQuality");
-    const fireBtn = document.getElementById("fireBtn");
 
     let detectedQuality = "low";
 
-    function doFire() {
-      const ms = Math.max(50, Math.min(Number(msInput.value || 500), 5000));
-      fetch(apiBase() + "/cicka?mode=pulse&ms=" + ms, { cache: "no-store" }).catch(console.error);
-    }
+    // ---- Motion Alert ----
+    const alertBtn  = document.getElementById("alertBtn");
+    const tgToken   = document.getElementById("tgToken");
+    const tgChatId  = document.getElementById("tgChatId");
+    let alerting = false;
 
-    fireBtn.addEventListener("click", doFire);
+    // Persist token/chat_id in localStorage so the user doesn't retype them
+    tgToken.value  = localStorage.getItem("tgToken")  || "";
+    tgChatId.value = localStorage.getItem("tgChatId") || "";
+    tgToken.addEventListener("input",  () => localStorage.setItem("tgToken",  tgToken.value));
+    tgChatId.addEventListener("input", () => localStorage.setItem("tgChatId", tgChatId.value));
 
-    const danceBtn = document.getElementById("danceBtn");
-
-    async function doDance() {
-      if (danceBtn.classList.contains("dancing")) return;
-      danceBtn.classList.add("dancing");
-      danceBtn.textContent = "🕺 DANCING...";
+    async function toggleAlert() {
+      const action = alerting ? "stop" : "start";
+      alertBtn.disabled = true;
       try {
-        const res = await fetch(apiBase() + "/servo/dance", { cache: "no-store" });
-        const text = await res.text();
-        cameraOut.textContent = text;
-      } catch (e) {
-        cameraOut.textContent = "Dance error: " + e;
-      } finally {
-        danceBtn.classList.remove("dancing");
-        danceBtn.textContent = "💃 DANCE";
-      }
-    }
-
-    danceBtn.addEventListener("click", doDance);
-
-    // ---- Tracker ----
-    const trackBtn  = document.getElementById("trackBtn");
-    const trackMode = document.getElementById("trackMode");
-    let tracking = false;
-
-    async function toggleTrack() {
-      const action = tracking ? "stop" : "start";
-      trackBtn.disabled = true;
-      try {
-        const mode = trackMode.value;
-        const url  = apiBase() + "/tracker?action=" + action + (action === "start" ? "&mode=" + mode : "");
+        let url = apiBase() + "/motion-alert?action=" + action;
+        if (action === "start") {
+          const token  = tgToken.value.trim();
+          const chatId = tgChatId.value.trim();
+          if (!token || !chatId) {
+            cameraOut.textContent = "Enter your Telegram bot token and chat ID first.";
+            return;
+          }
+          url += "&token=" + encodeURIComponent(token) + "&chat_id=" + encodeURIComponent(chatId);
+        }
         const res  = await fetch(url, { cache: "no-store" });
         const text = await res.text();
         if (res.ok) {
-          tracking = !tracking;
-          trackBtn.classList.toggle("tracking", tracking);
-          trackBtn.textContent = tracking ? "🎯 TRACKING..." : "🎯 TRACK";
-          trackMode.disabled   = tracking;
+          alerting = !alerting;
+          alertBtn.classList.toggle("alerting", alerting);
+          alertBtn.textContent = alerting ? "🔔 ALERTING..." : "🔔 MOTION ALERT";
         }
         cameraOut.textContent = text.trim();
       } catch (e) {
-        cameraOut.textContent = "Tracker error: " + e;
+        cameraOut.textContent = "Alert error: " + e;
       } finally {
-        trackBtn.disabled = false;
+        alertBtn.disabled = false;
       }
     }
 
-    trackBtn.addEventListener("click", toggleTrack);
-
-    async function moveServo(dir) {
-      const url = apiBase() + "/servo?dir=" + dir;
-      try {
-        await fetch(url, { cache: "no-store" });
-      } catch (e) {
-        console.error("Servo error:", e);
-      }
-    }
-    async function centerServo() {
-      const url = apiBase() + "/servo/center";
-      try {
-        await fetch(url, { cache: "no-store" });
-      } catch (e) {
-        console.error("Servo error:", e);
-      }
-    }
-    document.getElementById("aimUp").addEventListener("click", () => moveServo("up"));
-    document.getElementById("aimDown").addEventListener("click", () => moveServo("down"));
-    document.getElementById("aimLeft").addEventListener("click", () => moveServo("left"));
-    document.getElementById("aimRight").addEventListener("click", () => moveServo("right"));
-    document.getElementById("aimCenter").addEventListener("click", centerServo);
-
-    // ---- Keyboard arrow control (hold to repeat) + Space to fire ----
-    const KEY_DIRS = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
-    const heldKeys = {};
-
-    document.addEventListener("keydown", (e) => {
-      if (e.key === " ") { e.preventDefault(); if (!e.repeat) doFire(); return; }
-      const dir = KEY_DIRS[e.key];
-      if (!dir) return;
-      e.preventDefault();
-      if (heldKeys[e.key]) return;
-      moveServo(dir);
-      heldKeys[e.key] = setInterval(() => moveServo(dir), 150);
-    });
-
-    document.addEventListener("keyup", (e) => {
-      const dir = KEY_DIRS[e.key];
-      if (!dir) return;
-      clearInterval(heldKeys[e.key]);
-      delete heldKeys[e.key];
-    });
+    alertBtn.addEventListener("click", toggleAlert);
 
     async function testConnectionQuality() {
       connectionQuality.textContent = "Testing...";
@@ -1280,6 +1210,8 @@ app.get("/ui", (_req, res) => {
           if (!videoStream.src || videoStream.src.indexOf("/camera/stream") === -1) {
             videoStream.src = apiBase() + "/camera/stream?" + Date.now();
           }
+          // Ensure crosshair is drawn now that the area is visible
+          requestAnimationFrame(() => drawCrosshair(false));
         } else {
           cameraArea.classList.add("hidden");
           videoStream.src = "";
@@ -1322,6 +1254,92 @@ app.get("/ui", (_req, res) => {
           '<option value="medium"' + (this.value === "medium" ? " selected" : "") + '>Medium</option>' +
           '<option value="high"' + (this.value === "high" ? " selected" : "") + '>High</option>' +
           '<option value="veryhigh"' + (this.value === "veryhigh" ? " selected" : "") + '>Very High</option>';
+      }
+    });
+
+    // ---- Servo D-pad ----
+    async function servoDir(dir) {
+      try {
+        await fetch(apiBase() + "/servo?dir=" + dir, { cache: "no-store" });
+      } catch (e) {
+        cameraOut.textContent = "Servo error: " + e;
+      }
+    }
+
+    // ---- FIRE (relay pulse) ----
+    async function fireCannon() {
+      const btn = document.getElementById("fireBtn");
+      btn.disabled = true;
+      btn.textContent = "...";
+      flashCrosshair();
+      try {
+        const res = await fetch(apiBase() + "/cicka?mode=pulse&ms=300", { cache: "no-store" });
+        cameraOut.textContent = (await res.text()).trim();
+      } catch (e) {
+        cameraOut.textContent = "Fire error: " + e;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "FIRE";
+      }
+    }
+
+    // ---- Crosshair overlay ----
+    const crosshairCanvas = document.getElementById("crosshairCanvas");
+    const crosshairCtx = crosshairCanvas.getContext("2d");
+
+    function drawCrosshair(flash) {
+      const w = crosshairCanvas.width  = crosshairCanvas.offsetWidth;
+      const h = crosshairCanvas.height = crosshairCanvas.offsetHeight;
+      const cx = w / 2, cy = h / 2;
+      const gap = Math.min(w, h) * 0.045;
+      const arm = Math.min(w, h) * 0.13;
+      const r   = Math.min(w, h) * 0.055;
+      const color = flash ? "rgba(255,80,80,0.95)" : "rgba(0,255,80,0.85)";
+
+      crosshairCtx.clearRect(0, 0, w, h);
+      crosshairCtx.strokeStyle = color;
+      crosshairCtx.lineWidth = 2;
+      crosshairCtx.shadowColor = flash ? "#ff2020" : "#00ff50";
+      crosshairCtx.shadowBlur = 6;
+
+      // Center circle
+      crosshairCtx.beginPath();
+      crosshairCtx.arc(cx, cy, r, 0, Math.PI * 2);
+      crosshairCtx.stroke();
+
+      // Four arms
+      [[cx, cy - gap, cx, cy - gap - arm],
+       [cx, cy + gap, cx, cy + gap + arm],
+       [cx - gap, cy, cx - gap - arm, cy],
+       [cx + gap, cy, cx + gap + arm, cy]].forEach(([x1,y1,x2,y2]) => {
+        crosshairCtx.beginPath();
+        crosshairCtx.moveTo(x1, y1);
+        crosshairCtx.lineTo(x2, y2);
+        crosshairCtx.stroke();
+      });
+    }
+
+    drawCrosshair(false);
+    window.addEventListener("resize", () => drawCrosshair(false));
+    // Redraw once the video has actual dimensions (first frame decoded)
+    videoStream.addEventListener("load", () => drawCrosshair(false));
+
+    // Flash red on fire
+    function flashCrosshair() {
+      drawCrosshair(true);
+      setTimeout(() => drawCrosshair(false), 200);
+    }
+
+    // ---- Arrow key + spacebar support ----
+    document.addEventListener("keydown", (e) => {
+      const map = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right" };
+      if (map[e.key]) {
+        e.preventDefault();
+        servoDir(map[e.key]);
+      }
+      if (e.code === "Space") {
+        e.preventDefault();
+        fireCannon();
       }
     });
 

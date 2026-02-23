@@ -8,15 +8,24 @@
 import sys
 from Adafruit_PCA9685 import PCA9685
 
-SERVO_PULSE_MIN = 80    # pulse at 0° (mechanical minimum)
-SERVO_PULSE_MAX = 460   # pulse at max° (mechanical maximum)
 ANGLE_MIN = 0
 ANGLE_MAX = 270
 I2C_BUS = 1
 
-def angle_to_pulse(angle):
+# Per-channel pulse calibration.
+# Tune PULSE_MIN/PULSE_MAX for each channel to eliminate idle jitter.
+# At 50 Hz, 1 count ≈ 4.88 µs; a standard servo wants 1000–2000 µs (≈205–410 counts).
+# Defaults (80–460) cover a wide range; narrow them to match each servo's actual travel.
+CHANNEL_CONFIG = {
+  0: {"pulse_min": 80, "pulse_max": 460},   # horizontal servo
+  1: {"pulse_min": 80, "pulse_max": 460},   # vertical servo — tune these if ch1 jitters
+}
+DEFAULT_CONFIG = {"pulse_min": 80, "pulse_max": 460}
+
+def angle_to_pulse(angle, channel=None):
     angle = max(ANGLE_MIN, min(ANGLE_MAX, angle))
-    return int(SERVO_PULSE_MIN + (SERVO_PULSE_MAX - SERVO_PULSE_MIN) * angle / ANGLE_MAX)
+    cfg = CHANNEL_CONFIG.get(channel, DEFAULT_CONFIG) if channel is not None else DEFAULT_CONFIG
+    return int(cfg["pulse_min"] + (cfg["pulse_max"] - cfg["pulse_min"]) * angle / ANGLE_MAX)
 
 def main():
     try:
@@ -47,7 +56,7 @@ def main():
                 channel = int(parts[1])
                 angle = float(parts[2])
                 angle = max(ANGLE_MIN, min(ANGLE_MAX, angle))
-                pulse = angle_to_pulse(angle)
+                pulse = angle_to_pulse(angle, channel)
                 pca.set_pwm(channel, 0, pulse)
                 print(f"{seq}OK channel={channel} angle={angle:.1f} pulse={pulse}", flush=True)
 

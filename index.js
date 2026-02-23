@@ -729,11 +729,6 @@ app.get("/ui", (_req, res) => {
 
   <div class="main-card">
 
-    <!-- Camera row -->
-    <div class="camera-row">
-      <button class="blue" id="fullscreenBtn">⛶</button>
-    </div>
-
     <!-- Camera area (video + controls) -->
     <div id="cameraArea" class="hidden">
 
@@ -783,16 +778,10 @@ app.get("/ui", (_req, res) => {
 
   </div>
 
-  <div id="iosFullscreen">
-    <button id="iosClose">✕ CLOSE</button>
-    <img id="iosFullscreenImg">
-  </div>
-
   <script>
     const apiBase = () => location.protocol + "//" + location.hostname + ":3000";
 
     const videoStream = document.getElementById("videoStream");
-    const fullscreenBtn = document.getElementById("fullscreenBtn");
 
     let detectedQuality = "low";
 
@@ -889,24 +878,6 @@ app.get("/ui", (_req, res) => {
         setTimeout(() => { videoStream.src = apiBase() + "/camera/stream?" + Date.now(); }, 1000);
       }
     };
-
-    const iosFullscreen = document.getElementById("iosFullscreen");
-    const iosFullscreenImg = document.getElementById("iosFullscreenImg");
-    const iosClose = document.getElementById("iosClose");
-    const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-
-    fullscreenBtn.addEventListener("click", () => {
-      const videoWrapper = document.getElementById("videoWrapper");
-      if (isIOS()) {
-        iosFullscreenImg.src = videoStream.src;
-        iosFullscreen.classList.add("active");
-        document.body.style.overflow = "hidden";
-      } else if (videoWrapper.requestFullscreen) {
-        videoWrapper.requestFullscreen();
-      }
-    });
-    iosClose.addEventListener("click", () => { iosFullscreen.classList.remove("active"); document.body.style.overflow = ""; });
-    iosFullscreen.addEventListener("click", (e) => { if (e.target === iosFullscreen) { iosFullscreen.classList.remove("active"); document.body.style.overflow = ""; } });
 
     // ---- Servo control ----
     // servoDir sends one step. servoStep is throttled so rapid calls

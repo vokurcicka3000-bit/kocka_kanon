@@ -468,7 +468,7 @@ app.get("/tracker", async (req, res) => {
       return;
     }
 
-    trackerProcess = spawn("python3", ["-u", TRACKER_SCRIPT], {
+    trackerProcess = spawn("python3", ["-u", TRACKER_SCRIPT, "--mode", String(req.query.mode || "face")], {
       env: { ...process.env, PYTHONUNBUFFERED: "1" },
     });
 
@@ -793,13 +793,44 @@ app.get("/ui", (_req, res) => {
       border-radius: 50%;
       pointer-events: none;
     }
-    .controls {
-      margin: 15px 0;
+    .camera-row {
       display: flex;
       justify-content: center;
       align-items: center;
       gap: 10px;
       flex-wrap: wrap;
+      margin-bottom: 6px;
+    }
+    #connectionQuality {
+      font-size: 12px;
+      opacity: 0.8;
+    }
+    .aim-panel {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 24px;
+      margin: 12px 0;
+    }
+    .fire-panel {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+    }
+    .actions-bar {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      margin: 6px 0 4px;
+    }
+    .track-group {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
     }
     .arrow-pad {
       display: grid;
@@ -807,20 +838,6 @@ app.get("/ui", (_req, res) => {
       grid-template-rows: repeat(3, 50px);
       gap: 5px;
       justify-content: center;
-    }
-    .controls-row {
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
-      margin: 10px 0;
-    }
-    .fire-group {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 6px;
     }
     .fire-btn {
       width: 70px;
@@ -905,25 +922,6 @@ app.get("/ui", (_req, res) => {
     button.green { background: var(--green); color: #000; }
     button.red { background: var(--red); color: white; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
-    .small-card {
-      background: rgba(255,255,255,0.05);
-      border-radius: 12px;
-      padding: 10px;
-      margin: 10px auto;
-      max-width: 350px;
-      border: 2px solid rgba(255,255,255,0.1);
-      font-size: 12px;
-    }
-    .small-card h3 {
-      margin: 5px 0;
-      font-size: 14px;
-    }
-    .small-card button {
-      font-size: 12px;
-      padding: 6px 12px;
-    }
-    .small-card .row { margin: 8px 0; }
-    .status-text { font-size: 11px; opacity: 0.8; }
     .out-box {
       background: rgba(0,0,0,0.3);
       border-radius: 8px;
@@ -936,7 +934,6 @@ app.get("/ui", (_req, res) => {
       overflow-y: auto;
     }
     .out-box:empty { display: none; }
-    #connectionQuality { font-size: 12px; }
     #videoWrapper:fullscreen {
       background: #000;
       display: flex;
@@ -1038,7 +1035,9 @@ app.get("/ui", (_req, res) => {
   </h1>
 
   <div class="main-card">
-    <div class="controls">
+
+    <!-- Camera row -->
+    <div class="camera-row">
       <select id="qualitySelect">
         <option value="auto">Auto</option>
         <option value="verylow">Very Low</option>
@@ -1050,17 +1049,21 @@ app.get("/ui", (_req, res) => {
       <button class="green" id="cameraStartBtn">START</button>
       <button class="red" id="cameraStopBtn">STOP</button>
       <button class="blue" id="fullscreenBtn">⛶</button>
+      <span id="connectionQuality">Testing...</span>
     </div>
-    <div id="connectionQuality">Connection: Testing...</div>
-    
+
+    <!-- Camera area (video + controls) -->
     <div id="cameraArea" class="hidden">
+
+      <!-- Video -->
       <div class="video-wrapper" id="videoWrapper">
         <img id="videoStream" src="">
         <div class="crosshair"></div>
         <div class="crosshair-circle"></div>
       </div>
-      
-      <div class="controls-row">
+
+      <!-- Aim panel: d-pad left, FIRE right -->
+      <div class="aim-panel">
         <div class="arrow-pad">
           <div class="arrow-btn empty"></div>
           <button class="arrow-btn" id="aimUp">▲</button>
@@ -1073,23 +1076,29 @@ app.get("/ui", (_req, res) => {
           <div class="arrow-btn empty"></div>
         </div>
 
-        <div class="fire-group">
+        <div class="fire-panel">
           <button class="fire-btn armed" id="fireBtn">FIRE</button>
           <div class="fire-label">
             <input class="ms-input" id="ms" type="number" min="50" max="5000" value="500">
             <span>ms</span>
           </div>
         </div>
+      </div>
 
-        <div class="fire-group">
-          <button class="dance-btn" id="danceBtn">💃 DANCE</button>
-        </div>
-
-        <div class="fire-group">
+      <!-- Actions bottom bar -->
+      <div class="actions-bar">
+        <button class="dance-btn" id="danceBtn">💃 DANCE</button>
+        <div class="track-group">
           <button class="track-btn" id="trackBtn">🎯 TRACK</button>
+          <select id="trackMode">
+            <option value="face">Face</option>
+            <option value="motion">Motion</option>
+          </select>
         </div>
       </div>
+
     </div>
+
     <div id="cameraOut" class="out-box"></div>
   </div>
 
@@ -1141,19 +1150,23 @@ app.get("/ui", (_req, res) => {
     danceBtn.addEventListener("click", doDance);
 
     // ---- Tracker ----
-    const trackBtn = document.getElementById("trackBtn");
+    const trackBtn  = document.getElementById("trackBtn");
+    const trackMode = document.getElementById("trackMode");
     let tracking = false;
 
     async function toggleTrack() {
       const action = tracking ? "stop" : "start";
       trackBtn.disabled = true;
       try {
-        const res = await fetch(apiBase() + "/tracker?action=" + action, { cache: "no-store" });
+        const mode = trackMode.value;
+        const url  = apiBase() + "/tracker?action=" + action + (action === "start" ? "&mode=" + mode : "");
+        const res  = await fetch(url, { cache: "no-store" });
         const text = await res.text();
         if (res.ok) {
           tracking = !tracking;
           trackBtn.classList.toggle("tracking", tracking);
           trackBtn.textContent = tracking ? "🎯 TRACKING..." : "🎯 TRACK";
+          trackMode.disabled   = tracking;
         }
         cameraOut.textContent = text.trim();
       } catch (e) {

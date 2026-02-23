@@ -847,18 +847,7 @@ app.get("/ui", (_req, res) => {
     button.green { background: var(--green); color: #000; }
     button.red { background: var(--red); color: white; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
-    .out-box {
-      background: rgba(0,0,0,0.3);
-      border-radius: 8px;
-      padding: 8px;
-      font-family: monospace;
-      font-size: 10px;
-      white-space: pre-wrap;
-      text-align: left;
-      max-height: 60px;
-      overflow-y: auto;
-    }
-    .out-box:empty { display: none; }
+
     #videoWrapper:fullscreen {
       background: #000;
       display: flex;
@@ -1090,7 +1079,7 @@ app.get("/ui", (_req, res) => {
 
     </div>
 
-    <div id="cameraOut" class="out-box"></div>
+
   </div>
 
   <div id="iosFullscreen">
@@ -1101,7 +1090,6 @@ app.get("/ui", (_req, res) => {
   <script>
     const apiBase = () => location.protocol + "//" + location.hostname + ":3000";
 
-    const cameraOut = document.getElementById("cameraOut");
     const cameraStartBtn = document.getElementById("cameraStartBtn");
     const cameraStopBtn = document.getElementById("cameraStopBtn");
     const videoStream = document.getElementById("videoStream");
@@ -1132,7 +1120,8 @@ app.get("/ui", (_req, res) => {
           const token  = tgToken.value.trim();
           const chatId = tgChatId.value.trim();
           if (!token || !chatId) {
-            cameraOut.textContent = "Enter your Telegram bot token and chat ID first.";
+            alertBtn.textContent = "🔔 NEED TOKEN+ID";
+            setTimeout(() => { alertBtn.textContent = "🔔 MOTION ALERT"; }, 2000);
             return;
           }
           url += "&token=" + encodeURIComponent(token) + "&chat_id=" + encodeURIComponent(chatId);
@@ -1144,9 +1133,8 @@ app.get("/ui", (_req, res) => {
           alertBtn.classList.toggle("alerting", alerting);
           alertBtn.textContent = alerting ? "🔔 ALERTING..." : "🔔 MOTION ALERT";
         }
-        cameraOut.textContent = text.trim();
       } catch (e) {
-        cameraOut.textContent = "Alert error: " + e;
+        console.error("Alert error:", e);
       } finally {
         alertBtn.disabled = false;
       }
@@ -1192,11 +1180,10 @@ app.get("/ui", (_req, res) => {
     async function cameraApi(action) {
       let url = apiBase() + "/camera?action=" + action;
       if (action === "start") url += "&quality=" + getSelectedQuality();
-      cameraOut.textContent = "...";
       try {
-        cameraOut.textContent = await (await fetch(url, { cache: "no-store" })).text();
+        await fetch(url, { cache: "no-store" });
       } catch (e) {
-        cameraOut.textContent = "Error: " + e;
+        console.error("Camera error:", e);
       }
       cameraCheckStatus();
     }
@@ -1262,7 +1249,7 @@ app.get("/ui", (_req, res) => {
       try {
         await fetch(apiBase() + "/servo?dir=" + dir, { cache: "no-store" });
       } catch (e) {
-        cameraOut.textContent = "Servo error: " + e;
+        console.error("Servo error:", e);
       }
     }
 
@@ -1274,9 +1261,9 @@ app.get("/ui", (_req, res) => {
       flashCrosshair();
       try {
         const res = await fetch(apiBase() + "/cicka?mode=pulse&ms=300", { cache: "no-store" });
-        cameraOut.textContent = (await res.text()).trim();
+        await res.text();
       } catch (e) {
-        cameraOut.textContent = "Fire error: " + e;
+        console.error("Fire error:", e);
       } finally {
         btn.disabled = false;
         btn.textContent = "FIRE";

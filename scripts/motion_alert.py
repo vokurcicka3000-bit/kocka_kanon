@@ -51,7 +51,7 @@ MIN_AREA        = 4000
 FRAME_GAP       = 3
 # After motion is detected, wait this long before sending another alert (seconds).
 # Prevents notification spam when something moves continuously.
-COOLDOWN_S      = 10
+COOLDOWN_S      = 60
 # After motion alert, freeze the reference frame for this many frames so
 # the camera pan itself isn't detected as further motion.
 FREEZE_FRAMES   = 8

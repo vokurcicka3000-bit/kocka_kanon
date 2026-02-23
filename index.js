@@ -227,6 +227,8 @@ app.use((req, res, next) => {
   next();
 });
 
+app.use(express.static(path.join(__dirname, "public")));
+
 // set initial state
 writeRelayState("OFF");
 writeServoState(SERVO_CENTER, SERVO_CENTER);
@@ -712,297 +714,7 @@ app.get("/ui", (_req, res) => {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Kocka Kanon</title>
   <link href="https://fonts.googleapis.com/css2?family=Luckiest+Guy&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --yellow: #FFD90F;
-      --blue: #4A90E2;
-      --dark: #222;
-      --card: #fff6c9;
-      --red: #E53935;
-      --green: #2ecc71;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      padding: 10px;
-      font-family: "Luckiest Guy", system-ui, sans-serif;
-      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-      color: #fff;
-      text-align: center;
-      min-height: 100vh;
-    }
-    h1 {
-      font-size: 32px;
-      margin: 10px 0;
-      text-shadow: 2px 2px 0 #000;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 10px;
-    }
-    .cat-icon {
-      width: 40px;
-      height: 40px;
-      display: inline-block;
-    }
-    .main-card {
-      background: rgba(255,255,255,0.1);
-      border-radius: 20px;
-      padding: 15px;
-      max-width: 800px;
-      margin: 0 auto;
-      border: 3px solid rgba(255,255,255,0.2);
-    }
-    .video-wrapper {
-      position: relative;
-      display: inline-block;
-      width: 100%;
-      max-width: 640px;
-    }
-    #videoStream {
-      width: 100%;
-      border-radius: 10px;
-      border: 3px solid #000;
-      background: #000;
-    }
-    .crosshair-canvas {
-      position: absolute;
-      top: 0; left: 0;
-      width: 100%; height: 100%;
-      border-radius: 10px;
-      pointer-events: none;
-    }
-    .camera-row {
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-      margin-bottom: 6px;
-    }
-    #connectionQuality {
-      font-size: 12px;
-      opacity: 0.8;
-    }
-    .actions-bar {
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      gap: 16px;
-      flex-wrap: wrap;
-      margin: 12px 0 4px;
-    }
-    .alert-group {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 6px;
-    }
-    .alert-cfg {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-      font-size: 11px;
-      color: rgba(255,255,255,0.7);
-    }
-    .alert-cfg input {
-      font-family: monospace;
-      font-size: 11px;
-      padding: 4px 6px;
-      border-radius: 6px;
-      border: 2px solid #000;
-      background: rgba(255,255,255,0.15);
-      color: #fff;
-      width: 200px;
-    }
-    .alert-cfg input::placeholder { color: rgba(255,255,255,0.35); }
-    .arrow-pad {
-      display: grid;
-      grid-template-columns: repeat(3, 50px);
-      grid-template-rows: repeat(3, 50px);
-      gap: 5px;
-      justify-content: center;
-    }
-    select {
-      font-family: "Luckiest Guy", system-ui, sans-serif;
-      font-size: 14px;
-      padding: 8px;
-      border-radius: 10px;
-      border: 3px solid #000;
-      background: white;
-      cursor: pointer;
-    }
-    button {
-      font-family: "Luckiest Guy", system-ui, sans-serif;
-      font-size: 16px;
-      padding: 10px 16px;
-      border-radius: 12px;
-      border: 3px solid #000;
-      cursor: pointer;
-      box-shadow: 0 3px 0 #000;
-      transition: transform 0.05s ease;
-    }
-    button:active { transform: translateY(3px); box-shadow: 0 0 0 #000; }
-    button.blue { background: var(--blue); color: white; }
-    button.green { background: var(--green); color: #000; }
-    button.red { background: var(--red); color: white; }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
-
-    #videoWrapper:fullscreen {
-      background: #000;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    #videoWrapper:fullscreen img {
-      max-width: 100%;
-      max-height: 100%;
-    }
-    #iosFullscreen {
-      display: none;
-      position: fixed;
-      top: 0; left: 0;
-      width: 100%; height: 100%;
-      background: #000;
-      z-index: 9999;
-      align-items: center;
-      justify-content: center;
-    }
-    #iosFullscreen.active { display: flex; }
-    #iosFullscreen img { max-width: 100%; max-height: 100%; }
-    #iosClose {
-      position: absolute;
-      top: 10px; right: 10px;
-      background: var(--red);
-      color: white;
-      border: 3px solid #000;
-      border-radius: 10px;
-      padding: 10px 15px;
-      font-family: "Luckiest Guy", system-ui, sans-serif;
-      font-size: 16px;
-      cursor: pointer;
-    }
-    .hidden { display: none !important; }
-    .alert-btn {
-      background: #555;
-      color: #aaa;
-      font-size: 15px;
-      padding: 12px 18px;
-      border-radius: 14px;
-      border: 3px solid #000;
-      cursor: pointer;
-      box-shadow: 0 4px 0 #000;
-      transition: background 0.2s, color 0.2s, transform 0.05s;
-    }
-    .alert-btn:active { transform: translateY(4px); box-shadow: 0 0 0 #000; }
-    .alert-btn.alerting {
-      background: #e53935;
-      color: #fff;
-      animation: alert-pulse 1.2s ease-in-out infinite;
-    }
-    @keyframes alert-pulse {
-      0%, 100% { box-shadow: 0 4px 0 #000, 0 0 0px rgba(229,57,53,0); }
-      50%       { box-shadow: 0 4px 0 #000, 0 0 16px rgba(229,57,53,0.8); }
-    }
-
-    /* ---- D-pad + FIRE ---- */
-    .controls-row {
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      gap: 32px;
-      margin: 14px 0 6px;
-      flex-wrap: wrap;
-    }
-    .dpad {
-      display: grid;
-      grid-template-columns: repeat(3, 52px);
-      grid-template-rows: repeat(3, 52px);
-      gap: 4px;
-    }
-    .dpad-btn {
-      width: 52px;
-      height: 52px;
-      font-size: 22px;
-      padding: 0;
-      border-radius: 10px;
-      border: 3px solid #000;
-      cursor: pointer;
-      box-shadow: 0 4px 0 #000;
-      transition: transform 0.05s ease;
-      background: #4A90E2;
-      color: #fff;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .dpad-btn:active { transform: translateY(4px); box-shadow: 0 0 0 #000; }
-    .dpad-btn.center-btn {
-      background: rgba(255,255,255,0.1);
-      border-color: rgba(255,255,255,0.3);
-      color: rgba(255,255,255,0.3);
-      cursor: default;
-      box-shadow: none;
-      font-size: 13px;
-    }
-    .dpad-empty { width: 52px; height: 52px; }
-
-    /* Aircraft FIRE button */
-    .fire-wrap {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 6px;
-    }
-    .fire-guard {
-      position: relative;
-      width: 84px;
-      height: 84px;
-    }
-    /* Safety guard arc */
-    .fire-guard::before {
-      content: "";
-      position: absolute;
-      inset: -8px;
-      border-radius: 50%;
-      border: 5px solid #ff9800;
-      border-bottom-color: transparent;
-      border-left-color: transparent;
-      transform: rotate(-45deg);
-      pointer-events: none;
-      box-shadow: 0 0 8px rgba(255,152,0,0.6);
-    }
-    .fire-btn {
-      width: 84px;
-      height: 84px;
-      border-radius: 50%;
-      background: radial-gradient(circle at 35% 35%, #ff5252, #b71c1c);
-      border: 4px solid #000;
-      color: #fff;
-      font-family: "Luckiest Guy", system-ui, sans-serif;
-      font-size: 13px;
-      letter-spacing: 1px;
-      cursor: pointer;
-      box-shadow: 0 6px 0 #7f0000, 0 0 20px rgba(255,82,82,0.5);
-      transition: transform 0.05s ease, box-shadow 0.05s ease;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      text-align: center;
-      line-height: 1.1;
-    }
-    .fire-btn:active {
-      transform: translateY(6px);
-      box-shadow: 0 0 0 #7f0000, 0 0 28px rgba(255,82,82,0.9);
-    }
-    .fire-label {
-      font-size: 10px;
-      color: #ff9800;
-      letter-spacing: 2px;
-      text-transform: uppercase;
-    }
-    .fire-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  </style>
+  <link rel="stylesheet" href="/ui.css">
 </head>
 <body>
   <h1>
@@ -1019,18 +731,7 @@ app.get("/ui", (_req, res) => {
 
     <!-- Camera row -->
     <div class="camera-row">
-      <select id="qualitySelect">
-        <option value="auto">Auto</option>
-        <option value="verylow">Very Low</option>
-        <option value="low">Low</option>
-        <option value="medium">Medium</option>
-        <option value="high">High</option>
-        <option value="veryhigh">Very High</option>
-      </select>
-      <button class="green" id="cameraStartBtn">START</button>
-      <button class="red" id="cameraStopBtn">STOP</button>
       <button class="blue" id="fullscreenBtn">⛶</button>
-      <span id="connectionQuality">Testing...</span>
     </div>
 
     <!-- Camera area (video + controls) -->
@@ -1047,20 +748,20 @@ app.get("/ui", (_req, res) => {
         <!-- D-pad -->
         <div class="dpad">
           <div class="dpad-empty"></div>
-          <button class="dpad-btn" id="dUp"    title="Up (↑)"    onclick="servoDir('up')">▲</button>
+          <button class="dpad-btn" id="dUp"    data-dir="up"    title="Up (↑)">▲</button>
           <div class="dpad-empty"></div>
-          <button class="dpad-btn" id="dLeft"  title="Left (←)"  onclick="servoDir('left')">◀</button>
-          <button class="dpad-btn center-btn"  title="Camera aim">⊕</button>
-          <button class="dpad-btn" id="dRight" title="Right (→)" onclick="servoDir('right')">▶</button>
+          <button class="dpad-btn" id="dLeft"  data-dir="left"  title="Left (←)">◀</button>
+          <button class="dpad-btn center-btn" id="dCenter" title="Center servos">⊕</button>
+          <button class="dpad-btn" id="dRight" data-dir="right" title="Right (→)">▶</button>
           <div class="dpad-empty"></div>
-          <button class="dpad-btn" id="dDown"  title="Down (↓)"  onclick="servoDir('down')">▼</button>
+          <button class="dpad-btn" id="dDown"  data-dir="down"  title="Down (↓)">▼</button>
           <div class="dpad-empty"></div>
         </div>
 
         <!-- FIRE button -->
         <div class="fire-wrap">
           <div class="fire-guard">
-            <button class="fire-btn" id="fireBtn" onclick="fireCannon()">FIRE</button>
+            <button class="fire-btn" id="fireBtn">FIRE</button>
           </div>
           <span class="fire-label">&#9888; ARMED</span>
         </div>
@@ -1090,12 +791,8 @@ app.get("/ui", (_req, res) => {
   <script>
     const apiBase = () => location.protocol + "//" + location.hostname + ":3000";
 
-    const cameraStartBtn = document.getElementById("cameraStartBtn");
-    const cameraStopBtn = document.getElementById("cameraStopBtn");
     const videoStream = document.getElementById("videoStream");
     const fullscreenBtn = document.getElementById("fullscreenBtn");
-    const qualitySelect = document.getElementById("qualitySelect");
-    const connectionQuality = document.getElementById("connectionQuality");
 
     let detectedQuality = "low";
 
@@ -1143,43 +840,23 @@ app.get("/ui", (_req, res) => {
     alertBtn.addEventListener("click", toggleAlert);
 
     async function testConnectionQuality() {
-      connectionQuality.textContent = "Testing...";
       try {
         const start = performance.now();
         await (await fetch(apiBase() + "/camera/bandwidth-test?size=200", { cache: "no-store" })).arrayBuffer();
         const mbps = (200 * 8) / ((performance.now() - start) / 1000);
-        
         if (mbps > 50) detectedQuality = "veryhigh";
         else if (mbps > 30) detectedQuality = "high";
         else if (mbps > 15) detectedQuality = "medium";
         else if (mbps > 5) detectedQuality = "low";
         else detectedQuality = "verylow";
-        
-        connectionQuality.textContent = mbps.toFixed(1) + " Mbps";
-        connectionQuality.style.color = mbps > 15 ? "#2ecc71" : mbps > 5 ? "#f1c40f" : "#e74c3c";
-        updateQualitySelect();
       } catch (e) {
-        connectionQuality.textContent = "Test failed";
         detectedQuality = "verylow";
       }
     }
 
-    function updateQualitySelect() {
-      if (qualitySelect.value === "auto") {
-        qualitySelect.innerHTML = '<option value="auto" selected>Auto (' + detectedQuality + ')</option>' +
-          '<option value="verylow">Very Low</option><option value="low">Low</option>' +
-          '<option value="medium">Medium</option><option value="high">High</option>' +
-          '<option value="veryhigh">Very High</option>';
-      }
-    }
-
-    function getSelectedQuality() {
-      return qualitySelect.value === "auto" ? detectedQuality : qualitySelect.value;
-    }
-
     async function cameraApi(action) {
       let url = apiBase() + "/camera?action=" + action;
-      if (action === "start") url += "&quality=" + getSelectedQuality();
+      if (action === "start") url += "&quality=" + detectedQuality;
       try {
         await fetch(url, { cache: "no-store" });
       } catch (e) {
@@ -1231,27 +908,49 @@ app.get("/ui", (_req, res) => {
     iosClose.addEventListener("click", () => { iosFullscreen.classList.remove("active"); document.body.style.overflow = ""; });
     iosFullscreen.addEventListener("click", (e) => { if (e.target === iosFullscreen) { iosFullscreen.classList.remove("active"); document.body.style.overflow = ""; } });
 
-    cameraStartBtn.addEventListener("click", () => cameraApi("start"));
-    cameraStopBtn.addEventListener("click", () => cameraApi("stop"));
-    qualitySelect.addEventListener("change", function() {
-      if (this.value !== "auto") {
-        this.innerHTML = '<option value="auto">Auto (' + detectedQuality + ')</option>' +
-          '<option value="verylow"' + (this.value === "verylow" ? " selected" : "") + '>Very Low</option>' +
-          '<option value="low"' + (this.value === "low" ? " selected" : "") + '>Low</option>' +
-          '<option value="medium"' + (this.value === "medium" ? " selected" : "") + '>Medium</option>' +
-          '<option value="high"' + (this.value === "high" ? " selected" : "") + '>High</option>' +
-          '<option value="veryhigh"' + (this.value === "veryhigh" ? " selected" : "") + '>Very High</option>';
-      }
-    });
-
-    // ---- Servo D-pad ----
+    // ---- Servo control ----
+    // servoDir sends one step. servoStep is throttled so rapid calls
+    // don't flood the server while a hold or drag is active.
+    let servoInflight = false;
     async function servoDir(dir) {
+      if (servoInflight) return;
+      servoInflight = true;
       try {
         await fetch(apiBase() + "/servo?dir=" + dir, { cache: "no-store" });
       } catch (e) {
         console.error("Servo error:", e);
+      } finally {
+        servoInflight = false;
       }
     }
+
+    // ---- Hold-to-move D-pad ----
+    // Fires immediately on press, then repeats every REPEAT_MS while held.
+    const REPEAT_MS = 120;
+    let holdTimer = null;
+
+    function startHold(dir) {
+      if (holdTimer) return;
+      servoDir(dir);
+      holdTimer = setInterval(() => servoDir(dir), REPEAT_MS);
+    }
+
+    function stopHold() {
+      if (holdTimer) { clearInterval(holdTimer); holdTimer = null; }
+    }
+
+    document.querySelectorAll(".dpad-btn[data-dir]").forEach(btn => {
+      const dir = btn.dataset.dir;
+      btn.addEventListener("mousedown",  (e) => { e.preventDefault(); startHold(dir); });
+      btn.addEventListener("touchstart", (e) => { e.preventDefault(); startHold(dir); }, { passive: false });
+    });
+    document.addEventListener("mouseup",   stopHold);
+    document.addEventListener("touchend",  stopHold);
+    document.addEventListener("touchcancel", stopHold);
+
+    document.getElementById("dCenter").addEventListener("click", () => {
+      fetch(apiBase() + "/servo/center", { cache: "no-store" }).catch(console.error);
+    });
 
     // ---- FIRE (relay pulse) ----
     async function fireCannon() {
@@ -1260,8 +959,7 @@ app.get("/ui", (_req, res) => {
       btn.textContent = "...";
       flashCrosshair();
       try {
-        const res = await fetch(apiBase() + "/cicka?mode=pulse&ms=300", { cache: "no-store" });
-        await res.text();
+        await fetch(apiBase() + "/cicka?mode=pulse&ms=300", { cache: "no-store" });
       } catch (e) {
         console.error("Fire error:", e);
       } finally {
@@ -1269,21 +967,39 @@ app.get("/ui", (_req, res) => {
         btn.textContent = "FIRE";
       }
     }
+    document.getElementById("fireBtn").addEventListener("click", fireCannon);
 
     // ---- Crosshair overlay ----
     const crosshairCanvas = document.getElementById("crosshairCanvas");
     const crosshairCtx = crosshairCanvas.getContext("2d");
 
-    function drawCrosshair(flash) {
+    // cx/cy in canvas pixels — normally center, offset while dragging
+    let chX = null, chY = null;
+
+    function drawCrosshair(flash, ox, oy) {
       const w = crosshairCanvas.width  = crosshairCanvas.offsetWidth;
       const h = crosshairCanvas.height = crosshairCanvas.offsetHeight;
-      const cx = w / 2, cy = h / 2;
+      // Default to center
+      const cx = (ox != null) ? ox : w / 2;
+      const cy = (oy != null) ? oy : h / 2;
       const gap = Math.min(w, h) * 0.045;
       const arm = Math.min(w, h) * 0.13;
       const r   = Math.min(w, h) * 0.055;
       const color = flash ? "rgba(255,80,80,0.95)" : "rgba(0,255,80,0.85)";
 
       crosshairCtx.clearRect(0, 0, w, h);
+
+      // If dragging, draw a faint line from center to crosshair
+      if (ox != null && oy != null) {
+        crosshairCtx.beginPath();
+        crosshairCtx.moveTo(w / 2, h / 2);
+        crosshairCtx.lineTo(cx, cy);
+        crosshairCtx.strokeStyle = "rgba(0,255,80,0.25)";
+        crosshairCtx.lineWidth = 1;
+        crosshairCtx.shadowBlur = 0;
+        crosshairCtx.stroke();
+      }
+
       crosshairCtx.strokeStyle = color;
       crosshairCtx.lineWidth = 2;
       crosshairCtx.shadowColor = flash ? "#ff2020" : "#00ff50";
@@ -1308,25 +1024,112 @@ app.get("/ui", (_req, res) => {
 
     drawCrosshair(false);
     window.addEventListener("resize", () => drawCrosshair(false));
-    // Redraw once the video has actual dimensions (first frame decoded)
     videoStream.addEventListener("load", () => drawCrosshair(false));
 
-    // Flash red on fire
     function flashCrosshair() {
       drawCrosshair(true);
       setTimeout(() => drawCrosshair(false), 200);
     }
 
-    // ---- Arrow key + spacebar support ----
+    // ---- Drag-to-aim on the video ----
+    // Dragging maps the offset from center to servo direction.
+    // A "zone" threshold prevents tiny jitters from firing.
+    // While dragging, servo steps are sent continuously based on offset magnitude.
+    const DRAG_DEAD_PX  = 15;   // px from center before servo starts moving
+    const DRAG_STEP_MS  = 130;  // how often to send a servo step while dragging
+    const DRAG_FAST_PX  = 80;   // offset beyond which we send 2 steps per tick
+
+    let dragging = false;
+    let dragTimer = null;
+    let dragOffX = 0, dragOffY = 0;
+
+    function getCanvasPos(e) {
+      const rect = crosshairCanvas.getBoundingClientRect();
+      const src  = e.touches ? e.touches[0] : e;
+      return {
+        x: src.clientX - rect.left,
+        y: src.clientY - rect.top,
+      };
+    }
+
+    function dragStep() {
+      const w = crosshairCanvas.offsetWidth;
+      const h = crosshairCanvas.offsetHeight;
+      const absX = Math.abs(dragOffX), absY = Math.abs(dragOffY);
+      const steps = (Math.max(absX, absY) > DRAG_FAST_PX) ? 2 : 1;
+      // Send the dominant axis (or both if roughly equal)
+      for (let i = 0; i < steps; i++) {
+        if (absX >= DRAG_DEAD_PX && absX >= absY * 0.5) {
+          servoDir(dragOffX > 0 ? "right" : "left");
+        }
+        if (absY >= DRAG_DEAD_PX && absY >= absX * 0.5) {
+          servoDir(dragOffY > 0 ? "down" : "up");
+        }
+      }
+    }
+
+    function onDragStart(e) {
+      if (e.target === crosshairCanvas || e.target === videoStream) {
+        e.preventDefault();
+        dragging = true;
+        const pos = getCanvasPos(e);
+        const w = crosshairCanvas.offsetWidth, h = crosshairCanvas.offsetHeight;
+        dragOffX = pos.x - w / 2;
+        dragOffY = pos.y - h / 2;
+        drawCrosshair(false, pos.x, pos.y);
+        dragTimer = setInterval(dragStep, DRAG_STEP_MS);
+      }
+    }
+
+    function onDragMove(e) {
+      if (!dragging) return;
+      e.preventDefault();
+      const pos = getCanvasPos(e);
+      const w = crosshairCanvas.offsetWidth, h = crosshairCanvas.offsetHeight;
+      dragOffX = pos.x - w / 2;
+      dragOffY = pos.y - h / 2;
+      drawCrosshair(false, pos.x, pos.y);
+    }
+
+    function onDragEnd(e) {
+      if (!dragging) return;
+      dragging = false;
+      dragOffX = 0; dragOffY = 0;
+      if (dragTimer) { clearInterval(dragTimer); dragTimer = null; }
+      drawCrosshair(false); // snap back to center
+    }
+
+    crosshairCanvas.addEventListener("mousedown",   onDragStart);
+    crosshairCanvas.addEventListener("touchstart",  onDragStart, { passive: false });
+    document.addEventListener("mousemove",  onDragMove);
+    document.addEventListener("touchmove",  onDragMove, { passive: false });
+    document.addEventListener("mouseup",    onDragEnd);
+    document.addEventListener("touchend",   onDragEnd);
+    document.addEventListener("touchcancel",onDragEnd);
+
+    // Make the canvas show a grab cursor when hoverable
+    crosshairCanvas.style.cursor = "crosshair";
+
+    // ---- Keyboard: hold-to-repeat arrows + spacebar fire ----
+    const heldKeys = {};
     document.addEventListener("keydown", (e) => {
       const map = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right" };
-      if (map[e.key]) {
+      if (map[e.key] && !heldKeys[e.key]) {
         e.preventDefault();
-        servoDir(map[e.key]);
+        heldKeys[e.key] = true;
+        startHold(map[e.key]);
       }
       if (e.code === "Space") {
         e.preventDefault();
-        fireCannon();
+        if (!e.repeat) fireCannon();
+      }
+    });
+    document.addEventListener("keyup", (e) => {
+      const map = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right" };
+      if (map[e.key]) {
+        delete heldKeys[e.key];
+        // Only stop hold if no other arrow is still pressed
+        if (!Object.keys(heldKeys).length) stopHold();
       }
     });
 

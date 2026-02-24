@@ -1131,6 +1131,15 @@ app.get("/ui", (_req, res) => {
         </div>
       </div>
 
+      <!-- Watering controls -->
+      <div class="watering-bar">
+        <span class="watering-label">&#128167; WATERING</span>
+        <div class="watering-btns">
+          <button class="water-btn water-on-btn" id="waterOnBtn">&#9654; START</button>
+          <button class="water-btn water-off-btn" id="waterOffBtn" disabled>&#9632; STOP</button>
+        </div>
+      </div>
+
     </div>
 
 
@@ -1303,7 +1312,7 @@ app.get("/ui", (_req, res) => {
       }, 2000);
       flashCrosshair();
       try {
-        await fetch(apiBase() + "/cicka?mode=pulse&ms=300", { cache: "no-store" });
+        await fetch(apiBase() + "/cicka?mode=pulse&ms=1000", { cache: "no-store" });
       } catch (e) {
         console.error("Fire error:", e);
       } finally {
@@ -1314,6 +1323,40 @@ app.get("/ui", (_req, res) => {
       }
     }
     document.getElementById("fireBtn").addEventListener("click", fireCannon);
+
+    // ---- Watering (continuous on/off) ----
+    let wateringOn = false;
+    const waterOnBtn  = document.getElementById("waterOnBtn");
+    const waterOffBtn = document.getElementById("waterOffBtn");
+
+    async function startWatering() {
+      waterOnBtn.disabled = true;
+      try {
+        await fetch(apiBase() + "/cicka?mode=on", { cache: "no-store" });
+        wateringOn = true;
+        waterOnBtn.classList.add("running");
+        waterOffBtn.disabled = false;
+      } catch (e) {
+        console.error("Watering start error:", e);
+        waterOnBtn.disabled = false;
+      }
+    }
+
+    async function stopWatering() {
+      waterOffBtn.disabled = true;
+      try {
+        await fetch(apiBase() + "/cicka?mode=off", { cache: "no-store" });
+        wateringOn = false;
+        waterOnBtn.classList.remove("running");
+        waterOnBtn.disabled = false;
+      } catch (e) {
+        console.error("Watering stop error:", e);
+        waterOffBtn.disabled = false;
+      }
+    }
+
+    waterOnBtn.addEventListener("click", startWatering);
+    waterOffBtn.addEventListener("click", stopWatering);
 
      // ---- Crosshair + face-detection overlay ----
      const crosshairCanvas = document.getElementById("crosshairCanvas");
@@ -1620,22 +1663,22 @@ app.get("/ui", (_req, res) => {
          return;
        }
 
-       if (data.found) {
-         // 1. Show the detection box immediately
-         showFaceBox(data);
-         setSwitch("track");
+        if (data.found) {
+          // 1. Show the detection box immediately
+          showFaceBox(data);
+          setSwitch("track");
 
-          // 2. After 1 second: move servos, then clear the box and fire immediately
-          setTimeout(async () => {
-            try {
-              await fetch(apiBase() + "/face-track/move", { cache: "no-store" });
-            } catch (e) {
-              console.error("FaceTrack move error:", e);
-            }
+          // 2. Move servos immediately (no delay)
+          fetch(apiBase() + "/face-track/move", { cache: "no-store" }).catch(e => {
+            console.error("FaceTrack move error:", e);
+          });
+
+          // 3. After 1 second from face lock: clear box and fire
+          setTimeout(() => {
             clearFaceBox();
             setSwitch("safe");
             fireCannon();
-          }, 1000);
+          }, 500);
        } else {
          // Nothing found — show sad face briefly then return to safe
          setSwitch("notfound");

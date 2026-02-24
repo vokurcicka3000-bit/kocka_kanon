@@ -301,6 +301,61 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .track-stop-btn:active { transform: translateY(3px); box-shadow: 0 0 0 #000; }
 .track-stop-btn:hover  { background: #e53935; color: #fff; }
 
+/* ---- Watering bar ---- */
+.watering-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  margin: 10px 0 4px;
+  flex-wrap: wrap;
+}
+.watering-label {
+  font-size: 13px;
+  color: #4fc3f7;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  font-family: "Luckiest Guy", system-ui, sans-serif;
+}
+.watering-btns {
+  display: flex;
+  gap: 10px;
+}
+.water-btn {
+  font-size: 14px;
+  padding: 10px 20px;
+  border-radius: 12px;
+  border: 3px solid #000;
+  cursor: pointer;
+  box-shadow: 0 4px 0 #000;
+  transition: background 0.15s, color 0.15s, transform 0.05s;
+  font-family: "Luckiest Guy", system-ui, sans-serif;
+  letter-spacing: 1px;
+}
+.water-btn:active { transform: translateY(4px); box-shadow: 0 0 0 #000; }
+.water-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.water-on-btn {
+  background: #0288d1;
+  color: #fff;
+  box-shadow: 0 4px 0 #01579b;
+}
+.water-on-btn:active { box-shadow: 0 0 0 #01579b; }
+.water-on-btn.running {
+  background: #4fc3f7;
+  color: #000;
+  animation: water-pulse 1.4s ease-in-out infinite;
+}
+@keyframes water-pulse {
+  0%, 100% { box-shadow: 0 4px 0 #01579b, 0 0 0px rgba(79,195,247,0); }
+  50%       { box-shadow: 0 4px 0 #01579b, 0 0 14px rgba(79,195,247,0.8); }
+}
+.water-off-btn {
+  background: #555;
+  color: #aaa;
+  box-shadow: 0 4px 0 #222;
+}
+.water-off-btn:hover:not(:disabled) { background: #e53935; color: #fff; }
+
 .face-col {
   display: flex;
   flex-direction: column;
@@ -408,7 +463,8 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   text-transform: uppercase;
   transition: color 0.2s;
 }
-.face-guard[data-state="seeking"] ~ .face-label,
-.face-col:has([data-state="seeking"]) .face-label  { color: #ffdd00; }
+.face-col:has([data-state="seeking"]) .face-label,
+.face-guard[data-state="seeking"] ~ .face-label  { color: #ffdd00; }
 .face-col:has([data-state="track"])   .face-label  { color: #39ff14; }
 .face-col:has([data-state="notfound"]) .face-label { color: #ff5252; }
+

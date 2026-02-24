@@ -795,6 +795,7 @@ let motionCooldown      = false;  // true while in post-fire sleep
 let motionCooldownTimer = null;   // clearTimeout handle
 let motionSettleTimer   = null;   // clearTimeout handle for pre-fire settle delay
 let motionBoutActive    = false;  // true while motion is currently detected
+let motionServoInflight = false;  // true while a servo command is awaiting — skip new ones
 
 function stopMotionTracking() {
   if (motionTrackerProcess) {
@@ -805,6 +806,7 @@ function stopMotionTracking() {
   motionTrackerBuffer  = "";
   motionCooldown       = false;
   motionBoutActive     = false;
+  motionServoInflight  = false;
   if (motionCooldownTimer) { clearTimeout(motionCooldownTimer); motionCooldownTimer = null; }
   if (motionSettleTimer)   { clearTimeout(motionSettleTimer);   motionSettleTimer   = null; }
 }
@@ -824,7 +826,7 @@ function startMotionTracking() {
     console.error("[MotionTracker stderr]", d.toString().trim())
   );
 
-  motionTrackerProcess.stdout.on("data", async (d) => {
+  motionTrackerProcess.stdout.on("data", (d) => {
     motionTrackerBuffer += d.toString();
     const lines = motionTrackerBuffer.split("\n");
     motionTrackerBuffer = lines.pop();
@@ -860,7 +862,7 @@ function startMotionTracking() {
       // ---- In cooldown — skip everything ----
       if (motionCooldown) continue;
 
-      // ---- Apply P-controller ----
+      // ---- Apply P-controller (fire-and-forget — never await in the data handler) ----
       const offsetX = msg.cx - 0.5;
       const offsetY = msg.cy - 0.5;
 
@@ -876,13 +878,12 @@ function startMotionTracking() {
       const cmds = [];
       if (newH !== state.horizontal) cmds.push(servoCmd(`SET ${SERVO_H_CHANNEL} ${newH}`));
       if (newV !== state.vertical)   cmds.push(servoCmd(servoSetCmd(SERVO_V_CHANNEL, newV)));
-      if (cmds.length) {
-        try {
-          await Promise.all(cmds);
-          writeServoState(newH, newV);
-        } catch (e) {
-          console.error("[MotionTracker] servo error:", e.message);
-        }
+      if (cmds.length && !motionServoInflight) {
+        motionServoInflight = true;
+        writeServoState(newH, newV); // update state file immediately so next frame reads new position
+        Promise.all(cmds)
+          .catch((e) => console.error("[MotionTracker] servo error:", e.message))
+          .finally(() => { motionServoInflight = false; });
       }
 
       // ---- Schedule fire after settle delay (first frame of each bout only) ----
@@ -923,6 +924,7 @@ function startMotionTracking() {
     motionTrackerBuffer  = "";
     motionCooldown       = false;
     motionBoutActive     = false;
+    motionServoInflight  = false;
     if (motionCooldownTimer) { clearTimeout(motionCooldownTimer); motionCooldownTimer = null; }
     if (motionSettleTimer)   { clearTimeout(motionSettleTimer);   motionSettleTimer   = null; }
   });

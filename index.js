@@ -1312,7 +1312,7 @@ app.get("/ui", (_req, res) => {
       }, 2000);
       flashCrosshair();
       try {
-        await fetch(apiBase() + "/cicka?mode=pulse&ms=1000", { cache: "no-store" });
+        await fetch(apiBase() + "/cicka?mode=pulse&ms=1500", { cache: "no-store" });
       } catch (e) {
         console.error("Fire error:", e);
       } finally {

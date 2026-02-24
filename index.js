@@ -79,6 +79,8 @@ const SCRIPT = path.join(__dirname, "scripts", "relecko.py");
 const SERVO_SCRIPT = path.join(__dirname, "scripts", "servo.py");
 const BEEP_SCRIPT    = path.join(__dirname, "scripts", "beep.py");
 const MOTION_ALERT_SCRIPT = path.join(__dirname, "scripts", "motion_alert.py");
+const FACE_TRACKER_SCRIPT    = path.join(__dirname, "scripts", "face_tracker.py");
+const MOTION_TRACKER_SCRIPT  = path.join(__dirname, "scripts", "motion_tracker.py");
 const SERVO_PYTHON = path.join(__dirname, "scripts", "servo-env", "bin", "python");
 const MODES = new Set(["on", "off", "pulse"]);
 const PULSE_MIN_MS = 50;
@@ -514,7 +516,11 @@ app.get("/motion-alert", async (req, res) => {
           motionAlertReady = true;
           console.log("[MotionAlert] ready");
         } else if (line === "MOTION") {
-          console.log("[MotionAlert] motion detected");
+          // Don't move servos while alerting — let the camera stay still for clean GIF capture
+        } else if (line === "QUIET") {
+          // nothing to do — tracker is not started when alerting
+        } else if (line === "ENCODING") {
+          console.log("[MotionAlert] encoding started");
         }
       }
     });
@@ -560,6 +566,57 @@ const QUALITY_PRESETS = {
   low: { width: 960, height: 540, fps: 20, label: "Low" },
   verylow: { width: 640, height: 480, fps: 15, label: "Very Low" }
 };
+
+// Internal helpers — stop/start the MJPEG stream without going through HTTP.
+// Used by /face-track to free the camera for rpicam-still, then restore it.
+function stopCameraStream() {
+  return new Promise((resolve) => {
+    const pid = readCameraPid();
+    if (!isProcessRunning(pid) && !cameraProcess) { resolve(); return; }
+    if (cameraProcess) { cameraProcess.kill("SIGTERM"); cameraProcess = null; }
+    exec(`kill ${pid} 2>/dev/null; true`, () => {
+      clearCameraPid();
+      cameraClients.clear();
+      frameBuffer = Buffer.alloc(0);
+      latestFrame = null;
+      // Give the OS a moment to fully release the camera device
+      setTimeout(resolve, 600);
+    });
+  });
+}
+
+function startCameraStream(quality) {
+  return new Promise((resolve, reject) => {
+    const preset = QUALITY_PRESETS[quality] || QUALITY_PRESETS[currentQuality] || QUALITY_PRESETS.low;
+    currentQuality = quality || currentQuality;
+    frameBuffer = Buffer.alloc(0);
+    cameraClients.clear();
+    latestFrame = null;
+    cameraProcess = spawn("rpicam-vid", [
+      "-t", "0", "--codec", "mjpeg",
+      "--width", String(preset.width),
+      "--height", String(preset.height),
+      "--framerate", String(preset.fps),
+      "--autofocus-mode", "continuous",
+      "-o", "-"
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    cameraProcess.stdout.on("data", broadcastFrame);
+    cameraProcess.on("error", (err) => { console.error("[Camera] spawn error:", err); reject(err); });
+    cameraProcess.on("exit", (code) => {
+      console.log("[Camera] exited with code", code);
+      clearCameraPid();
+      cameraProcess = null;
+      cameraClients.clear();
+      frameBuffer = Buffer.alloc(0);
+      latestFrame = null;
+    });
+    writeCameraPid(cameraProcess.pid);
+    setTimeout(() => {
+      if (isProcessRunning(cameraProcess && cameraProcess.pid)) resolve();
+      else reject(new Error("Camera failed to restart"));
+    }, 500);
+  });
+}
 
 function broadcastFrame(chunk) {
   frameBuffer = Buffer.concat([frameBuffer, chunk]);
@@ -705,6 +762,253 @@ app.get("/camera/bandwidth-test", (req, res) => {
   res.type("application/octet-stream").send(data);
 });
 
+// -------------------- Face Tracking --------------------
+// Fire-and-poll pattern to avoid blocking the browser UI during the 5–8 s scan.
+//
+// GET /face-track         → start a scan; returns { status:"started" } immediately,
+//                           or { status:"busy" } if one is already running.
+// GET /face-track/result  → { status:"pending" } while running,
+//                           or full result JSON when done:
+//                             { found, label, cx, cy, bx, by, bw, bh, dx, dy, moved }
+//                           or { error } on failure.
+//
+// The result is cleared when a new scan is started.
+
+let faceTrackJob = null; // null | { status: "running" | "done", result: <obj> }
+
+async function runFaceTrack() {
+  try {
+    await _runFaceTrackInner();
+  } catch (err) {
+    // Catch-all: guarantee faceTrackJob is never left as "running"
+    console.error("[FaceTrack] unhandled error:", err);
+    faceTrackJob = { status: "done", result: { error: err.message } };
+  }
+}
+
+async function _runFaceTrackInner() {
+  // face_tracker.py now grabs a frame from the live MJPEG stream — no camera
+  // stop/restart needed; the stream keeps running throughout.
+  let result;
+  try {
+    const py = await runPython(FACE_TRACKER_SCRIPT, []);
+    if (!py.stdout) {
+      result = { error: "face_tracker.py produced no output", stderr: py.stderr };
+    } else {
+      result = JSON.parse(py.stdout);
+    }
+  } catch (err) {
+    console.error("[FaceTrack] error:", err);
+    result = { error: err.message };
+  }
+
+  if (result.error) {
+    faceTrackJob = { status: "done", result };
+    return;
+  }
+
+  if (!result.found) {
+    faceTrackJob = { status: "done", result: { found: false, label: "none" } };
+    return;
+  }
+
+  const offsetX = result.cx - 0.5;
+  const offsetY = result.cy - 0.5;
+  const DEAD = 0.05;
+  const needsH = Math.abs(offsetX) > DEAD;
+  const needsV = Math.abs(offsetY) > DEAD;
+
+  if (!needsH && !needsV) {
+    faceTrackJob = {
+      status: "done",
+      result: {
+        found: true, label: result.label,
+        cx: result.cx, cy: result.cy,
+        bx: result.bx, by: result.by, bw: result.bw, bh: result.bh,
+        dx: 0, dy: 0, moved: false,
+      },
+    };
+    return;
+  }
+
+  const MAX_DELTA = 30;
+  const dH = Math.max(-MAX_DELTA, Math.min(MAX_DELTA, -offsetX * SERVO_MAX));
+  const dV = Math.max(-MAX_DELTA, Math.min(MAX_DELTA, -offsetY * SERVO_MAX));
+
+  const state = readServoState();
+  const newH = needsH ? Math.max(SERVO_MIN, Math.min(SERVO_MAX, Math.round(state.horizontal + dH))) : state.horizontal;
+  const newV = needsV ? Math.max(SERVO_MIN, Math.min(SERVO_MAX, Math.round(state.vertical   + dV))) : state.vertical;
+
+  try {
+    const cmds = [];
+    if (newH !== state.horizontal) cmds.push(servoCmd(`SET ${SERVO_H_CHANNEL} ${newH}`));
+    if (newV !== state.vertical)   cmds.push(servoCmd(servoSetCmd(SERVO_V_CHANNEL, newV)));
+    if (cmds.length) await Promise.all(cmds);
+    writeServoState(newH, newV);
+    faceTrackJob = {
+      status: "done",
+      result: {
+        found: true,
+        label: result.label,
+        cx: result.cx, cy: result.cy,
+        bx: result.bx, by: result.by, bw: result.bw, bh: result.bh,
+        dx: newH - state.horizontal,
+        dy: newV - state.vertical,
+        moved: cmds.length > 0,
+      },
+    };
+  } catch (err) {
+    console.error("[FaceTrack] servo error:", err);
+    faceTrackJob = { status: "done", result: { error: err.message } };
+  }
+}
+
+app.get("/face-track", (req, res) => {
+  if (faceTrackJob && faceTrackJob.status === "running") {
+    res.json({ status: "busy" });
+    return;
+  }
+  faceTrackJob = { status: "running", result: null };
+  runFaceTrack(); // fire and forget — do NOT await
+  res.json({ status: "started" });
+});
+
+app.get("/face-track/result", (req, res) => {
+  if (!faceTrackJob || faceTrackJob.status === "running") {
+    res.json({ status: "pending" });
+    return;
+  }
+  // Return the result (status:"done" is implicit — client gets the raw result object)
+  res.json(faceTrackJob.result);
+});
+
+// -------------------- Motion Tracking --------------------
+// Spawns motion_tracker.py which reads the MJPEG stream and emits JSON lines.
+// For each active frame, Node applies a P-controller to move the servos.
+// Every REFINE_INTERVAL_S seconds (signalled by refine:true from the script)
+// we run a one-shot face-detect pass to sharpen the aim.
+//
+// P-controller tuning:
+//   offsetX = cx - 0.5   (range -0.5 .. +0.5; positive = target is right of centre)
+//   dH = -offsetX * TRACK_GAIN  (negative: target right → decrease H angle)
+//   dV = -offsetY * TRACK_GAIN  (negative: target below → decrease V angle)
+//   clamped to ±TRACK_MAX_STEP degrees per cycle
+
+const TRACK_GAIN     = 70;   // proportional gain (degrees per unit offset)
+const TRACK_MAX_STEP = 10;   // max degrees to move in one cycle
+
+let motionTrackerProcess  = null;
+let motionTrackingActive  = false;
+let motionTrackerBuffer   = "";
+
+function stopMotionTracking() {
+  if (motionTrackerProcess) {
+    try { motionTrackerProcess.kill("SIGTERM"); } catch (_) {}
+    motionTrackerProcess = null;
+  }
+  motionTrackingActive = false;
+  motionTrackerBuffer  = "";
+}
+
+function startMotionTracking() {
+  if (motionTrackerProcess) return; // already running
+
+  motionTrackerProcess = spawn("python3", ["-u", MOTION_TRACKER_SCRIPT], {
+    env: { ...process.env, PYTHONUNBUFFERED: "1" },
+  });
+  motionTrackingActive = true;
+  motionTrackerBuffer  = "";
+
+  motionTrackerProcess.stderr.on("data", (d) =>
+    console.error("[MotionTracker stderr]", d.toString().trim())
+  );
+
+  motionTrackerProcess.stdout.on("data", async (d) => {
+    motionTrackerBuffer += d.toString();
+    const lines = motionTrackerBuffer.split("\n");
+    motionTrackerBuffer = lines.pop();
+
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+
+      let msg;
+      try { msg = JSON.parse(line); }
+      catch (_) { continue; }
+
+      if (msg.ready) {
+        console.log("[MotionTracker] stream connected");
+        continue;
+      }
+
+      if (msg.error) {
+        console.error("[MotionTracker] error:", msg.error);
+        stopMotionTracking();
+        return;
+      }
+
+      if (!msg.active) continue; // quiet frame — nothing to do
+
+      // ---- Apply P-controller ----
+      const offsetX = msg.cx - 0.5;
+      const offsetY = msg.cy - 0.5;
+
+      const rawDH = -offsetX * TRACK_GAIN;
+      const rawDV = -offsetY * TRACK_GAIN;
+      const dH = Math.max(-TRACK_MAX_STEP, Math.min(TRACK_MAX_STEP, rawDH));
+      const dV = Math.max(-TRACK_MAX_STEP, Math.min(TRACK_MAX_STEP, rawDV));
+
+      const state = readServoState();
+      const newH  = Math.max(SERVO_MIN, Math.min(SERVO_MAX, Math.round(state.horizontal + dH)));
+      const newV  = Math.max(SERVO_MIN, Math.min(SERVO_MAX, Math.round(state.vertical   + dV)));
+
+      const cmds = [];
+      if (newH !== state.horizontal) cmds.push(servoCmd(`SET ${SERVO_H_CHANNEL} ${newH}`));
+      if (newV !== state.vertical)   cmds.push(servoCmd(servoSetCmd(SERVO_V_CHANNEL, newV)));
+      if (cmds.length) {
+        try {
+          await Promise.all(cmds);
+          writeServoState(newH, newV);
+        } catch (e) {
+          console.error("[MotionTracker] servo error:", e.message);
+        }
+      }
+
+      // ---- Face-detection refinement ----
+      if (msg.refine && (!faceTrackJob || faceTrackJob.status !== "running")) {
+        faceTrackJob = { status: "running", result: null };
+        // Fire-and-forget — _runFaceTrackInner handles camera stop/restart
+        runFaceTrack();
+      }
+    }
+  });
+
+  motionTrackerProcess.on("error", (e) => {
+    console.error("[MotionTracker] spawn error:", e);
+    stopMotionTracking();
+  });
+
+  motionTrackerProcess.on("exit", (code) => {
+    console.log("[MotionTracker] exited with code", code);
+    motionTrackerProcess = null;
+    motionTrackingActive = false;
+    motionTrackerBuffer  = "";
+  });
+
+  console.log("[MotionTracker] started");
+}
+
+// API: /motion-track/status
+app.get("/motion-track/status", (_req, res) => {
+  res.json({ active: motionTrackingActive });
+});
+
+// API: /motion-track/stop
+app.get("/motion-track/stop", (_req, res) => {
+  stopMotionTracking();
+  res.json({ stopped: true });
+});
+
 // Simple UI
 app.get("/ui", (_req, res) => {
   res.type("html").send(`<!doctype html>
@@ -712,7 +1016,7 @@ app.get("/ui", (_req, res) => {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Kocka Kanon</title>
+  <title>Kočka kanón</title>
   <link href="https://fonts.googleapis.com/css2?family=Luckiest+Guy&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/ui.css">
 </head>
@@ -724,7 +1028,7 @@ app.get("/ui", (_req, res) => {
       <circle cx="65" cy="55" r="5" fill="#111"/>
       <ellipse cx="50" cy="68" rx="5" ry="3" fill="#ff9999"/>
     </svg>
-    Kocka Kanon
+    Kočka kanón
   </h1>
 
   <div class="main-card">
@@ -753,29 +1057,61 @@ app.get("/ui", (_req, res) => {
           <div class="dpad-empty"></div>
         </div>
 
-        <!-- FIRE button -->
+        <!-- FIRE button + Find-face button -->
         <div class="fire-wrap">
-          <div class="fire-guard">
-            <button class="fire-btn" id="fireBtn">FIRE</button>
+          <!-- Face-track button: same design as FIRE, smiley face SVG -->
+          <div class="face-col">
+            <div class="face-guard" id="faceTrackBtn" role="button" title="Find face">
+              <svg class="face-svg" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
+                <!-- face circle outline -->
+                <circle cx="20" cy="20" r="17" stroke="currentColor" stroke-width="2.5" fill="none"/>
+                <!-- eyes -->
+                <circle class="face-eye" cx="13" cy="15" r="2.5" fill="currentColor"/>
+                <circle class="face-eye" cx="27" cy="15" r="2.5" fill="currentColor"/>
+                <!-- mouth: normal smile -->
+                <path class="face-smile" d="M12 24 Q20 32 28 24" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+                <!-- mouth: seeking — straight line, hidden by default -->
+                <path class="face-meh" d="M13 26 L27 26" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+                <!-- mouth: notfound — sad, hidden by default -->
+                <path class="face-sad" d="M12 28 Q20 20 28 28" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+                <!-- seeking: spinning scan arc, hidden by default -->
+                <circle class="face-scan" cx="20" cy="20" r="17" stroke="currentColor" stroke-width="3"
+                        fill="none" stroke-dasharray="28 80" stroke-linecap="round"/>
+              </svg>
+            </div>
+            <span class="face-label">SEEK</span>
           </div>
-          <span class="fire-label">&#9888; ARMED</span>
+
+          <div class="fire-col">
+            <div class="fire-guard">
+              <button class="fire-btn" id="fireBtn">FIRE</button>
+            </div>
+            <span class="fire-label">&#9888; ARMED</span>
+          </div>
         </div>
       </div>
 
-      <!-- Actions bar: motion alert -->
+      <!-- Actions bar: motion alert + tracking indicator -->
       <div class="actions-bar">
         <div class="alert-group">
           <button class="alert-btn" id="alertBtn">🔔 MOTION ALERT</button>
-          <div class="alert-cfg">
-            <input id="tgToken"  type="text" placeholder="Telegram bot token" autocomplete="off" spellcheck="false">
-            <input id="tgChatId" type="text" placeholder="Telegram chat ID"   autocomplete="off" spellcheck="false">
-          </div>
+        </div>
+        <!-- Motion tracking indicator — hidden when not tracking -->
+        <div class="track-group hidden" id="trackGroup">
+          <div class="track-indicator" id="trackIndicator">&#9654; TRACKING</div>
+          <button class="track-stop-btn" id="trackStopBtn">&#9632; STOP</button>
         </div>
       </div>
 
     </div>
 
 
+  </div>
+
+  <!-- Telegram credentials — fixed bottom-left, intentionally unobtrusive -->
+  <div class="tg-cfg">
+    <input id="tgToken"  type="text" placeholder="Telegram bot token" autocomplete="off" spellcheck="false">
+    <input id="tgChatId" type="text" placeholder="Telegram chat ID"   autocomplete="off" spellcheck="false">
   </div>
 
   <script>
@@ -924,18 +1260,29 @@ app.get("/ui", (_req, res) => {
     });
 
     // ---- FIRE (relay pulse) ----
+    let fireInFlight = false;
     async function fireCannon() {
+      if (fireInFlight) return;
       const btn = document.getElementById("fireBtn");
+      fireInFlight = true;
       btn.disabled = true;
       btn.textContent = "...";
+      // Safety net: always re-enable after 2 s even if fetch hangs
+      const safetyTimer = setTimeout(() => {
+        btn.disabled = false;
+        btn.textContent = "FIRE";
+        fireInFlight = false;
+      }, 2000);
       flashCrosshair();
       try {
         await fetch(apiBase() + "/cicka?mode=pulse&ms=300", { cache: "no-store" });
       } catch (e) {
         console.error("Fire error:", e);
       } finally {
+        clearTimeout(safetyTimer);
         btn.disabled = false;
         btn.textContent = "FIRE";
+        fireInFlight = false;
       }
     }
     document.getElementById("fireBtn").addEventListener("click", fireCannon);
@@ -1103,6 +1450,129 @@ app.get("/ui", (_req, res) => {
         if (!Object.keys(heldKeys).length) stopHold();
       }
     });
+
+    // ---- Face tracking ----
+    const faceTrackBtn = document.getElementById("faceTrackBtn");
+
+    // Initialise the switch to SAFE position
+    faceTrackBtn.dataset.state = "safe";
+
+    // ---- Face tracking — fire-and-poll ----
+    // Flipping the switch to TRACK fires GET /face-track (returns instantly) then
+    // polls GET /face-track/result every 500 ms.
+    // Flipping back to SAFE while scanning cancels the UI poll (scan still finishes
+    // server-side but result is ignored).
+    // The FIRE button stays enabled at all times.
+    let faceTrackPolling = null;
+
+    function stopFaceTrackPolling() {
+      if (faceTrackPolling !== null) {
+        clearInterval(faceTrackPolling);
+        faceTrackPolling = null;
+      }
+    }
+
+    function setSwitch(state) { faceTrackBtn.dataset.state = state; }
+
+    function onFaceTrackResult(data) {
+      stopFaceTrackPolling();
+
+      if (data.error) {
+        setSwitch("safe");
+        return;
+      }
+
+      if (data.found) {
+        setSwitch("track"); // green lit — TRACK confirmed
+        setTimeout(() => {
+          setSwitch("safe");
+        }, 2000);
+      } else {
+        // Nothing found — show sad face briefly then return to safe
+        setSwitch("notfound");
+        setTimeout(() => setSwitch("safe"), 1500);
+      }
+    }
+
+    faceTrackBtn.addEventListener("click", async () => {
+      const state = faceTrackBtn.dataset.state;
+
+      // TRACK/SEEKING → SAFE: cancel any ongoing poll, reset visuals
+      if (state === "track" || state === "seeking" || state === "notfound") {
+        stopFaceTrackPolling();
+        setSwitch("safe");
+        return;
+      }
+
+      // SAFE → SEEK: start a scan
+      setSwitch("seeking");
+
+      try {
+        const kickoff = await fetch(apiBase() + "/face-track", { cache: "no-store" });
+        const kickData = await kickoff.json();
+        if (kickData.status !== "started" && kickData.status !== "busy") {
+          throw new Error("Unexpected kickoff response: " + JSON.stringify(kickData));
+        }
+      } catch (e) {
+        console.error("FaceTrack kickoff error:", e);
+        setSwitch("safe");
+        return;
+      }
+
+      // Poll /face-track/result every 500 ms; give up after 30 s
+      const pollStart = Date.now();
+      faceTrackPolling = setInterval(async () => {
+        // If user flipped back to SAFE manually, stop polling
+        if (faceTrackBtn.dataset.state === "safe") { stopFaceTrackPolling(); return; }
+        // Timeout guard — avoid polling forever if server is stuck
+        if (Date.now() - pollStart > 30000) {
+          console.warn("FaceTrack poll timeout");
+          stopFaceTrackPolling();
+          setSwitch("safe");
+          return;
+        }
+        try {
+          const r = await fetch(apiBase() + "/face-track/result", { cache: "no-store" });
+          const d = await r.json();
+          if (d.status === "pending") return;
+          onFaceTrackResult(d);
+        } catch (e) {
+          console.error("FaceTrack poll error:", e);
+          stopFaceTrackPolling();
+          setSwitch("safe");
+        }
+      }, 500);
+    });
+
+    // ---- Motion tracking indicator ----
+    const trackGroup    = document.getElementById("trackGroup");
+    const trackStopBtn  = document.getElementById("trackStopBtn");
+    let trackingActive  = false;
+
+    function setTrackingUI(active) {
+      trackingActive = active;
+      trackGroup.classList.toggle("hidden", !active);
+    }
+
+    async function pollTrackingStatus() {
+      try {
+        const r = await fetch(apiBase() + "/motion-track/status", { cache: "no-store" });
+        const d = await r.json();
+        setTrackingUI(!!d.active);
+      } catch (_) {}
+    }
+
+    trackStopBtn.addEventListener("click", async () => {
+      try {
+        await fetch(apiBase() + "/motion-track/stop", { cache: "no-store" });
+        setTrackingUI(false);
+      } catch (e) {
+        console.error("Track stop error:", e);
+      }
+    });
+
+    // Poll tracking status every 1.5 s
+    setInterval(pollTrackingStatus, 1500);
 
     // Auto-start camera on load
     testConnectionQuality().then(() => cameraApi("start"));

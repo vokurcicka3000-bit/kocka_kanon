@@ -1625,7 +1625,7 @@ app.get("/ui", (_req, res) => {
          showFaceBox(data);
          setSwitch("track");
 
-          // 2. After 1 second: move servos, then clear the box right away
+          // 2. After 1 second: move servos, then clear the box and fire immediately
           setTimeout(async () => {
             try {
               await fetch(apiBase() + "/face-track/move", { cache: "no-store" });
@@ -1634,8 +1634,7 @@ app.get("/ui", (_req, res) => {
             }
             clearFaceBox();
             setSwitch("safe");
-            // 3. Wait 0.5s for turret to settle, then fire
-            setTimeout(() => fireCannon(), 500);
+            fireCannon();
           }, 1000);
        } else {
          // Nothing found — show sad face briefly then return to safe

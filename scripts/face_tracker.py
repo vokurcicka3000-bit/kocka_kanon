@@ -32,6 +32,8 @@ CAT_CASCADE_PATH = os.path.join(CASCADE_DIR, "haarcascade_frontalcatface_extende
 STREAM_URL       = "http://localhost:3000/camera/stream"
 STREAM_TIMEOUT   = 10   # seconds to wait for first frame
 YUNET_THRESHOLD  = 0.5
+DETECT_W         = 640  # downscale to this width before detection (faster on Pi)
+DETECT_H         = 480
 
 args = sys.argv[1:]
 if args:
@@ -112,8 +114,11 @@ def main():
 
     fh, fw = bgr.shape[:2]
 
+    # Downscale for faster detection — coords are normalised so no adjustment needed
+    small = cv2.resize(bgr, (DETECT_W, DETECT_H), interpolation=cv2.INTER_LINEAR)
+
     # Human face via YuNet
-    faces = detect_yunet(bgr)
+    faces = detect_yunet(small)
     if faces:
       cx, cy, bx, by, bw, bh, score = max(faces, key=lambda d: d[6])
       print(json.dumps({"found": True,
@@ -125,7 +130,7 @@ def main():
       return
 
     # Cat face fallback
-    cats = detect_cat_haar(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
+    cats = detect_cat_haar(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))
     if cats:
       cx, cy, bx, by, bw, bh, score = max(cats, key=lambda d: d[6])
       print(json.dumps({"found": True,

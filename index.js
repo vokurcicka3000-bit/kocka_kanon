@@ -567,11 +567,12 @@ let latestFrame = null;
 let currentQuality = "low";
 
 const QUALITY_PRESETS = {
-  veryhigh: { width: 2592, height: 1944, fps: 15, label: "Very High" },
-  high: { width: 1920, height: 1080, fps: 30, label: "High" },
-  medium: { width: 1280, height: 720, fps: 30, label: "Medium" },
-  low: { width: 960, height: 540, fps: 20, label: "Low" },
-  verylow: { width: 640, height: 480, fps: 15, label: "Very Low" }
+  veryhigh: { width: 2592, height: 1944, fps: 15, quality: 50, label: "Very High" },
+  high:     { width: 1920, height: 1080, fps: 30, quality: 60, label: "High"      },
+  medium:   { width: 1280, height: 720,  fps: 30, quality: 70, label: "Medium"    },
+  low:      { width: 960,  height: 540,  fps: 20, quality: 75, label: "Low"       },
+  verylow:  { width: 640,  height: 480,  fps: 15, quality: 80, label: "Very Low"  },
+  cellular: { width: 480,  height: 270,  fps: 10, quality: 88, label: "Cellular"  },
 };
 
 // Internal helpers — stop/start the MJPEG stream without going through HTTP.
@@ -604,6 +605,7 @@ function startCameraStream(quality) {
       "--width", String(preset.width),
       "--height", String(preset.height),
       "--framerate", String(preset.fps),
+      "--quality", String(preset.quality),
       "--autofocus-mode", "continuous",
       "-o", "-"
     ], { stdio: ["ignore", "pipe", "pipe"] });
@@ -681,6 +683,7 @@ app.get("/camera", (req, res) => {
       "--width", String(preset.width),
       "--height", String(preset.height),
       "--framerate", String(preset.fps),
+      "--quality", String(preset.quality),
       "--autofocus-mode", "continuous",
       "-o", "-"
     ], { stdio: ["ignore", "pipe", "pipe"] });
@@ -818,6 +821,11 @@ async function _runFaceTrackInner() {
     faceTrackJob = { status: "done", result: { found: false, label: "none" } };
     return;
   }
+
+  console.log(
+    `[FaceTrack] detected ${result.label} at (cx=${result.cx.toFixed(3)}, cy=${result.cy.toFixed(3)})` +
+    (result.score != null ? ` score=${(result.score * 100).toFixed(1)}%` : "")
+  );
 
   const offsetX = result.cx - 0.5;
   const offsetY = result.cy - 0.5;
@@ -1068,6 +1076,17 @@ app.get("/ui", (_req, res) => {
       <div class="video-wrapper" id="videoWrapper">
         <img id="videoStream" src="">
         <canvas class="crosshair-canvas" id="crosshairCanvas"></canvas>
+        <div class="quality-bar">
+          <select id="qualitySelect">
+            <option value="auto">Auto</option>
+            <option value="cellular">Cellular</option>
+            <option value="verylow">Very Low</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+            <option value="veryhigh">Very High</option>
+          </select>
+        </div>
       </div>
 
       <!-- Camera controls: D-pad + FIRE -->
@@ -1157,6 +1176,11 @@ app.get("/ui", (_req, res) => {
     const videoStream = document.getElementById("videoStream");
 
     let detectedQuality = "low";
+    const qualitySelect = document.getElementById("qualitySelect");
+
+    // Restore last manual choice if any
+    const savedQuality = localStorage.getItem("quality");
+    if (savedQuality) qualitySelect.value = savedQuality;
 
     // ---- Motion Alert ----
     const alertBtn  = document.getElementById("alertBtn");
@@ -1204,21 +1228,29 @@ app.get("/ui", (_req, res) => {
     async function testConnectionQuality() {
       try {
         const start = performance.now();
-        await (await fetch(apiBase() + "/camera/bandwidth-test?size=200", { cache: "no-store" })).arrayBuffer();
-        const mbps = (200 * 8) / ((performance.now() - start) / 1000);
+        await (await fetch(apiBase() + "/camera/bandwidth-test?size=50", { cache: "no-store" })).arrayBuffer();
+        const mbps = (50 * 8) / ((performance.now() - start) / 1000);
         if (mbps > 50) detectedQuality = "veryhigh";
         else if (mbps > 30) detectedQuality = "high";
         else if (mbps > 15) detectedQuality = "medium";
-        else if (mbps > 5) detectedQuality = "low";
-        else detectedQuality = "verylow";
+        else if (mbps > 5)  detectedQuality = "low";
+        else if (mbps > 1)  detectedQuality = "verylow";
+        else                detectedQuality = "cellular";
       } catch (e) {
-        detectedQuality = "verylow";
+        detectedQuality = "cellular";
       }
     }
 
     async function cameraApi(action) {
       let url = apiBase() + "/camera?action=" + action;
-      if (action === "start") url += "&quality=" + detectedQuality;
+      if (action === "start") {
+        const chosen = qualitySelect.value;
+        const q = chosen === "auto" ? detectedQuality : chosen;
+        url += "&quality=" + q;
+        // Reflect actual quality in the dropdown when auto
+        if (chosen === "auto") qualitySelect.title = "Auto: " + q;
+        else qualitySelect.title = "";
+      }
       try {
         await fetch(url, { cache: "no-store" });
       } catch (e) {
@@ -1226,6 +1258,14 @@ app.get("/ui", (_req, res) => {
       }
       cameraCheckStatus();
     }
+
+    qualitySelect.addEventListener("change", async () => {
+      const v = qualitySelect.value;
+      if (v === "auto") localStorage.removeItem("quality");
+      else localStorage.setItem("quality", v);
+      await fetch(apiBase() + "/camera?action=stop", { cache: "no-store" }).catch(() => {});
+      cameraApi("start");
+    });
 
     async function cameraCheckStatus() {
       try {
@@ -1609,28 +1649,28 @@ app.get("/ui", (_req, res) => {
     // Make the canvas show a grab cursor when hoverable
     crosshairCanvas.style.cursor = "crosshair";
 
-    // ---- Keyboard: hold-to-repeat arrows + spacebar fire ----
-    const heldKeys = {};
-    document.addEventListener("keydown", (e) => {
-      const map = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right" };
-      if (map[e.key] && !heldKeys[e.key]) {
-        e.preventDefault();
-        heldKeys[e.key] = true;
-        startHold(map[e.key]);
-      }
-      if (e.code === "Space") {
-        e.preventDefault();
-        if (!e.repeat) fireCannon();
-      }
-    });
-    document.addEventListener("keyup", (e) => {
-      const map = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right" };
-      if (map[e.key]) {
-        delete heldKeys[e.key];
-        // Only stop hold if no other arrow is still pressed
-        if (!Object.keys(heldKeys).length) stopHold();
-      }
-    });
+     // ---- Keyboard: hold-to-repeat arrows + spacebar fire ----
+     const heldKeys = {};
+     document.addEventListener("keydown", (e) => {
+       const map = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right" };
+       if (map[e.key] && !heldKeys[e.key]) {
+         e.preventDefault();
+         heldKeys[e.key] = true;
+         startHold(map[e.key]);
+       }
+        if (e.code === "Space") {
+          e.preventDefault();
+          if (!e.repeat) fireCannon();
+        }
+      });
+      document.addEventListener("keyup", (e) => {
+        const map = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right" };
+        if (map[e.key]) {
+          delete heldKeys[e.key];
+          // Only stop hold if no other arrow is still pressed
+          if (!Object.keys(heldKeys).length) stopHold();
+        }
+      });
 
     // ---- Face tracking ----
     const faceTrackBtn = document.getElementById("faceTrackBtn");

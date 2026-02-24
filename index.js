@@ -93,6 +93,13 @@ const SERVO_CENTER = 135;
 const SERVO_H_CHANNEL = 0;
 const SERVO_V_CHANNEL = 1;
 const SERVO_V_SETTLE_MS = 500; // ms to hold position before cutting PWM on vertical servo
+// Camera field of view used for face-tracking servo movement.
+// Tune SERVO_FOV_H/V: increase if undershoots, decrease if overshoots.
+// Tune SERVO_TRACK_GAMMA: < 1 compresses large offsets (helps with fish-eye overshoot at edges),
+//   > 1 expands them. 0.7 is a good starting point for a fish-eye lens.
+const SERVO_FOV_H = 150;       // degrees horizontal
+const SERVO_FOV_V = 112;       // degrees vertical
+const SERVO_TRACK_GAMMA = 0.7; // power-curve correction for fish-eye distortion
 
 // -------------------- Helpers --------------------
 function clampInt(value, min, max, fallback) {
@@ -825,6 +832,7 @@ async function _runFaceTrackInner() {
         found: true, label: result.label,
         cx: result.cx, cy: result.cy,
         bx: result.bx, by: result.by, bw: result.bw, bh: result.bh,
+        w: result.w, h: result.h,
         dx: 0, dy: 0, moved: false,
       },
       pendingMove: null,
@@ -832,9 +840,11 @@ async function _runFaceTrackInner() {
     return;
   }
 
-  const MAX_DELTA = 30;
-  const dH = Math.max(-MAX_DELTA, Math.min(MAX_DELTA, -offsetX * SERVO_MAX));
-  const dV = Math.max(-MAX_DELTA, Math.min(MAX_DELTA, -offsetY * SERVO_MAX));
+  // Apply power-curve gamma to compensate for fish-eye lens distortion.
+  // sign(x) * |x|^gamma preserves direction but compresses large offsets when gamma < 1.
+  const applyGamma = (x) => Math.sign(x) * Math.pow(Math.abs(x), SERVO_TRACK_GAMMA);
+  const dH = -applyGamma(offsetX) * SERVO_FOV_H;
+  const dV = -applyGamma(offsetY) * SERVO_FOV_V;
 
   const state = readServoState();
   const newH = needsH ? Math.max(SERVO_MIN, Math.min(SERVO_MAX, Math.round(state.horizontal + dH))) : state.horizontal;
@@ -849,6 +859,7 @@ async function _runFaceTrackInner() {
       label: result.label,
       cx: result.cx, cy: result.cy,
       bx: result.bx, by: result.by, bw: result.bw, bh: result.bh,
+      w: result.w, h: result.h,
       dx: newH - state.horizontal,
       dy: newV - state.vertical,
       moved: false,
@@ -1328,10 +1339,33 @@ app.get("/ui", (_req, res) => {
        }
      }
 
-     function drawFaceBox(w, h) {
+     function drawFaceBox(canvasW, canvasH) {
        if (!faceBox) return;
-       const { bx, by, bw, bh, label, score } = faceBox;
-       const px = bx * w, py = by * h, pw = bw * w, ph = bh * h;
+       const { bx, by, bw, bh, label, score, w: frameW, h: frameH } = faceBox;
+
+       const natW = frameW || canvasW;
+       const natH = frameH || canvasH;
+       const imgAspect    = natW / natH;
+       const canvasAspect = canvasW / canvasH;
+
+       let imgW, imgH, imgX, imgY;
+       if (imgAspect > canvasAspect) {
+         imgW = canvasW;
+         imgH = canvasW / imgAspect;
+         imgX = 0;
+         imgY = (canvasH - imgH) / 2;
+       } else {
+         imgH = canvasH;
+         imgW = canvasH * imgAspect;
+         imgX = (canvasW - imgW) / 2;
+         imgY = 0;
+       }
+
+       const px = imgX + bx * imgW;
+       const py = imgY + by * imgH;
+       const pw = bw * imgW;
+       const ph = bh * imgH;
+
        const isCat = label === "cat";
        const boxColor  = isCat ? "rgba(255,200,0,0.95)"  : "rgba(0,220,255,0.95)";
        const glowColor = isCat ? "#ffc800"                : "#00dcff";
@@ -1358,8 +1392,8 @@ app.get("/ui", (_req, res) => {
        });
 
        // Centre dot
-       const dotX = (bx + bw / 2) * w;
-       const dotY = (by + bh / 2) * h;
+       const dotX = px + pw / 2;
+       const dotY = py + ph / 2;
        crosshairCtx.beginPath();
        crosshairCtx.arc(dotX, dotY, lw * 1.5, 0, Math.PI * 2);
        crosshairCtx.fillStyle = boxColor;

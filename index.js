@@ -745,9 +745,11 @@ app.get("/camera/stream", async (req, res) => {
     // Cancel any pending idle-stop timer
     if (cameraIdleTimer) { clearTimeout(cameraIdleTimer); cameraIdleTimer = null; }
 
-    if (!cameraProcess || !isProcessRunning(readCameraPid())) {
-      const quality = String(req.query.quality || currentQuality || "low").toLowerCase();
+    const quality = String(req.query.quality || currentQuality || "low").toLowerCase();
+    const needsRestart = !cameraProcess || !isProcessRunning(readCameraPid()) || quality !== currentQuality;
+    if (needsRestart) {
       try {
+        await stopCameraStream();
         await startCameraStream(quality);
       } catch (err) {
         console.error("[Camera] auto-start failed:", err);
@@ -1013,8 +1015,8 @@ function startMotionTracking() {
 
       if (msg.error) {
         console.error("[MotionTracker] error:", msg.error);
-        stopMotionTracking();
-        return;
+        // Python reconnects itself — don't kill the process here
+        continue;
       }
 
       if (!msg.active) continue; // quiet frame — nothing to do
@@ -1116,6 +1118,16 @@ app.get("/ui", (_req, res) => {
       <div class="video-wrapper" id="videoWrapper">
         <img id="videoStream" src="">
         <canvas class="crosshair-canvas" id="crosshairCanvas"></canvas>
+        <!-- Quality selector — bottom-left corner overlay -->
+        <div class="quality-bar">
+          <select id="qualitySelect" title="Video quality">
+            <option value="veryhigh">Very High</option>
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
+            <option value="low" selected>Low</option>
+            <option value="verylow">Very Low</option>
+          </select>
+        </div>
       </div>
 
       <!-- Camera controls: D-pad + FIRE -->
@@ -1167,15 +1179,10 @@ app.get("/ui", (_req, res) => {
         </div>
       </div>
 
-      <!-- Actions bar: motion alert + tracking indicator -->
+      <!-- Actions bar: motion alert -->
       <div class="actions-bar">
         <div class="alert-group">
           <button class="alert-btn" id="alertBtn">🔔 MOTION ALERT</button>
-        </div>
-        <!-- Motion tracking indicator — hidden when not tracking -->
-        <div class="track-group hidden" id="trackGroup">
-          <div class="track-indicator" id="trackIndicator">&#9654; TRACKING</div>
-          <button class="track-stop-btn" id="trackStopBtn">&#9632; STOP</button>
         </div>
       </div>
 
@@ -1773,40 +1780,24 @@ app.get("/ui", (_req, res) => {
     });
 
     // ---- Motion tracking indicator ----
-    const trackGroup    = document.getElementById("trackGroup");
-    const trackStopBtn  = document.getElementById("trackStopBtn");
-    let trackingActive  = false;
+    // ---- Quality dropdown ----
+    const qualitySelect = document.getElementById("qualitySelect");
 
-    function setTrackingUI(active) {
-      trackingActive = active;
-      trackGroup.classList.toggle("hidden", !active);
+    function applyQuality(quality) {
+      detectedQuality = quality;
+      qualitySelect.value = quality;
+      // Reconnect the stream at the new quality — server restarts the camera
+      videoStream.src = apiBase() + "/camera/stream?src=ui&quality=" + quality + "&t=" + Date.now();
     }
 
-    async function pollTrackingStatus() {
-      try {
-        const r = await fetch(apiBase() + "/motion-track/status", { cache: "no-store" });
-        const d = await r.json();
-        setTrackingUI(!!d.active);
-      } catch (_) {}
-    }
-
-    trackStopBtn.addEventListener("click", async () => {
-      try {
-        await fetch(apiBase() + "/motion-track/stop", { cache: "no-store" });
-        setTrackingUI(false);
-      } catch (e) {
-        console.error("Track stop error:", e);
-      }
-    });
-
-    // Poll tracking status every 1.5 s
-    setInterval(pollTrackingStatus, 1500);
+    qualitySelect.addEventListener("change", () => applyQuality(qualitySelect.value));
 
     // Connect the video stream — the server will auto-start the camera for us.
     // Quality is detected first so the server knows what resolution to use.
     testConnectionQuality().then(() => {
       const cameraArea = document.getElementById("cameraArea");
       cameraArea.classList.remove("hidden");
+      qualitySelect.value = detectedQuality;
       videoStream.src = apiBase() + "/camera/stream?src=ui&quality=" + detectedQuality + "&t=" + Date.now();
       requestAnimationFrame(() => drawCrosshair(false));
     });

@@ -57,6 +57,8 @@ REFINE_INTERVAL_S = 4.0
 MAX_FPS         = 10
 # How long to wait between reconnect attempts when the stream is unavailable
 RECONNECT_WAIT_S = 2.0
+# Seconds to suppress motion output after stream connects (camera settle time)
+WARMUP_S = 4.0
 
 
 def emit(obj):
@@ -114,6 +116,7 @@ def run():
     last_refine_t   = 0.0
     motion_active   = False
     last_frame_t    = 0.0
+    warmup_until    = None   # set after first frame; suppress motion until elapsed
 
     try:
       for jpeg in iter_mjpeg_frames(STREAM_URL):
@@ -134,6 +137,13 @@ def run():
         if not ready_sent:
           emit({"ready": True})
           ready_sent = True
+          # Give the camera time to settle (auto-exposure / auto-focus warm-up).
+          # Suppress motion output for the first WARMUP_S seconds.
+          warmup_until = now + WARMUP_S
+
+        # During warm-up: feed frames into the ring buffer so the diff baseline
+        # builds up, but never emit active=true to the servo controller.
+        in_warmup = warmup_until is not None and now < warmup_until
 
         # Downsample + blur to reduce noise
         sw = max(1, int(w * DETECT_SCALE))
@@ -166,6 +176,10 @@ def run():
         if area >= MIN_AREA and largest is not None:
           last_motion_t = now
           motion_active = True
+
+          if in_warmup:
+            emit({"active": False})
+            continue
 
           # Centroid of the largest contour in detection-scale pixels
           M   = cv2.moments(largest)

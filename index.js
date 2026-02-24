@@ -79,7 +79,6 @@ const SCRIPT = path.join(__dirname, "scripts", "relecko.py");
 const SERVO_SCRIPT = path.join(__dirname, "scripts", "servo.py");
 const BEEP_SCRIPT    = path.join(__dirname, "scripts", "beep.py");
 const MOTION_ALERT_SCRIPT = path.join(__dirname, "scripts", "motion_alert.py");
-const FACE_TRACKER_SCRIPT    = path.join(__dirname, "scripts", "face_tracker.py");
 const MOTION_TRACKER_SCRIPT  = path.join(__dirname, "scripts", "motion_tracker.py");
 const SERVO_PYTHON = path.join(__dirname, "scripts", "servo-env", "bin", "python");
 const MODES = new Set(["on", "off", "pulse"]);
@@ -93,13 +92,6 @@ const SERVO_CENTER = 135;
 const SERVO_H_CHANNEL = 0;
 const SERVO_V_CHANNEL = 1;
 const SERVO_V_SETTLE_MS = 500; // ms to hold position before cutting PWM on vertical servo
-// Camera field of view used for face-tracking servo movement.
-// Tune SERVO_FOV_H/V: increase if undershoots, decrease if overshoots.
-// Tune SERVO_TRACK_GAMMA: < 1 compresses large offsets (helps with fish-eye overshoot at edges),
-//   > 1 expands them. 0.7 is a good starting point for a fish-eye lens.
-const SERVO_FOV_H = 150;       // degrees horizontal
-const SERVO_FOV_V = 112;       // degrees vertical
-const SERVO_TRACK_GAMMA = 0.7; // power-curve correction for fish-eye distortion
 
 // -------------------- Helpers --------------------
 function clampInt(value, min, max, fallback) {
@@ -576,7 +568,6 @@ const QUALITY_PRESETS = {
 };
 
 // Internal helpers — stop/start the MJPEG stream without going through HTTP.
-// Used by /face-track to free the camera for rpicam-still, then restore it.
 function stopCameraStream() {
   return new Promise((resolve) => {
     const pid = readCameraPid();
@@ -772,157 +763,17 @@ app.get("/camera/bandwidth-test", (req, res) => {
   res.type("application/octet-stream").send(data);
 });
 
-// -------------------- Face Tracking --------------------
-// Fire-and-poll pattern to avoid blocking the browser UI during the 5–8 s scan.
-//
-// GET /face-track         → start a scan; returns { status:"started" } immediately,
-//                           or { status:"busy" } if one is already running.
-// GET /face-track/result  → { status:"pending" } while running,
-//                           or full result JSON when done:
-//                             { found, label, cx, cy, bx, by, bw, bh, dx, dy, moved }
-//                           or { error } on failure.
-//
-// The result is cleared when a new scan is started.
-
-let faceTrackJob = null; // null | { status: "running" | "done", result: <obj> }
-
-async function runFaceTrack() {
-  try {
-    await _runFaceTrackInner();
-  } catch (err) {
-    // Catch-all: guarantee faceTrackJob is never left as "running"
-    console.error("[FaceTrack] unhandled error:", err);
-    faceTrackJob = { status: "done", result: { error: err.message } };
-  }
-}
-
-async function _runFaceTrackInner() {
-  // face_tracker.py now grabs a frame from the live MJPEG stream — no camera
-  // stop/restart needed; the stream keeps running throughout.
-  let result;
-  try {
-    const py = await runPython(FACE_TRACKER_SCRIPT, []);
-    if (!py.stdout) {
-      result = { error: "face_tracker.py produced no output", stderr: py.stderr };
-    } else {
-      result = JSON.parse(py.stdout);
-    }
-  } catch (err) {
-    console.error("[FaceTrack] error:", err);
-    result = { error: err.message };
-  }
-
-  if (result.error) {
-    faceTrackJob = { status: "done", result };
-    return;
-  }
-
-  if (!result.found) {
-    faceTrackJob = { status: "done", result: { found: false, label: "none" } };
-    return;
-  }
-
-  console.log(
-    `[FaceTrack] detected ${result.label} at (cx=${result.cx.toFixed(3)}, cy=${result.cy.toFixed(3)})` +
-    (result.score != null ? ` score=${(result.score * 100).toFixed(1)}%` : "")
-  );
-
-  const offsetX = result.cx - 0.5;
-  const offsetY = result.cy - 0.5;
-  const DEAD = 0.05;
-  const needsH = Math.abs(offsetX) > DEAD;
-  const needsV = Math.abs(offsetY) > DEAD;
-
-  if (!needsH && !needsV) {
-    faceTrackJob = {
-      status: "done",
-      result: {
-        found: true, label: result.label,
-        cx: result.cx, cy: result.cy,
-        bx: result.bx, by: result.by, bw: result.bw, bh: result.bh,
-        w: result.w, h: result.h,
-        dx: 0, dy: 0, moved: false,
-      },
-      pendingMove: null,
-    };
-    return;
-  }
-
-  // Apply power-curve gamma to compensate for fish-eye lens distortion.
-  // sign(x) * |x|^gamma preserves direction but compresses large offsets when gamma < 1.
-  const applyGamma = (x) => Math.sign(x) * Math.pow(Math.abs(x), SERVO_TRACK_GAMMA);
-  const dH = -applyGamma(offsetX) * SERVO_FOV_H;
-  const dV = -applyGamma(offsetY) * SERVO_FOV_V;
-
-  const state = readServoState();
-  const newH = needsH ? Math.max(SERVO_MIN, Math.min(SERVO_MAX, Math.round(state.horizontal + dH))) : state.horizontal;
-  const newV = needsV ? Math.max(SERVO_MIN, Math.min(SERVO_MAX, Math.round(state.vertical   + dV))) : state.vertical;
-
-  // Store the intended move but don't execute yet — client will call /face-track/move
-  // after showing the detection box for 1 second.
-  faceTrackJob = {
-    status: "done",
-    result: {
-      found: true,
-      label: result.label,
-      cx: result.cx, cy: result.cy,
-      bx: result.bx, by: result.by, bw: result.bw, bh: result.bh,
-      w: result.w, h: result.h,
-      dx: newH - state.horizontal,
-      dy: newV - state.vertical,
-      moved: false,
-    },
-    pendingMove: { newH, newV },
-  };
-}
-
-app.get("/face-track", (req, res) => {
-  if (faceTrackJob && faceTrackJob.status === "running") {
-    res.json({ status: "busy" });
-    return;
-  }
-  faceTrackJob = { status: "running", result: null };
-  runFaceTrack(); // fire and forget — do NOT await
-  res.json({ status: "started" });
-});
-
-app.get("/face-track/result", (req, res) => {
-  if (!faceTrackJob || faceTrackJob.status === "running") {
-    res.json({ status: "pending" });
-    return;
-  }
-  // Return the result (status:"done" is implicit — client gets the raw result object)
-  res.json(faceTrackJob.result);
-});
-
-// Execute the deferred servo move stored by /face-track.
-// Called by the client after showing the detection box for 1 second.
-app.get("/face-track/move", async (req, res) => {
-  if (!faceTrackJob || !faceTrackJob.pendingMove) {
-    res.json({ moved: false });
-    return;
-  }
-  const { newH, newV } = faceTrackJob.pendingMove;
-  faceTrackJob.pendingMove = null;
-  const state = readServoState();
-  try {
-    const cmds = [];
-    if (newH !== state.horizontal) cmds.push(servoCmd(`SET ${SERVO_H_CHANNEL} ${newH}`));
-    if (newV !== state.vertical)   cmds.push(servoCmd(servoSetCmd(SERVO_V_CHANNEL, newV)));
-    if (cmds.length) await Promise.all(cmds);
-    writeServoState(newH, newV);
-    res.json({ moved: cmds.length > 0 });
-  } catch (err) {
-    console.error("[FaceTrack/move] servo error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // -------------------- Motion Tracking --------------------
 // Spawns motion_tracker.py which reads the MJPEG stream and emits JSON lines.
-// For each active frame, Node applies a P-controller to move the servos.
-// Every REFINE_INTERVAL_S seconds (signalled by refine:true from the script)
-// we run a one-shot face-detect pass to sharpen the aim.
+// For each active motion frame, Node applies a P-controller to track the
+// motion centroid with the servos, then fires the cannon.
+//
+// Fire-and-cooldown state machine:
+//   - When motion is detected and NOT in cooldown: track with P-controller,
+//     then fire after FIRE_SETTLE_MS (to allow servo to settle on target).
+//   - After firing: cooldown for FIRE_COOLDOWN_MS — ignore all motion frames.
+//   - During cooldown: skip P-controller and fire entirely.
 //
 // P-controller tuning:
 //   offsetX = cx - 0.5   (range -0.5 .. +0.5; positive = target is right of centre)
@@ -930,12 +781,20 @@ app.get("/face-track/move", async (req, res) => {
 //   dV = -offsetY * TRACK_GAIN  (negative: target below → decrease V angle)
 //   clamped to ±TRACK_MAX_STEP degrees per cycle
 
-const TRACK_GAIN     = 70;   // proportional gain (degrees per unit offset)
-const TRACK_MAX_STEP = 10;   // max degrees to move in one cycle
+const TRACK_GAIN       = 70;    // proportional gain (degrees per unit offset)
+const TRACK_MAX_STEP   = 10;    // max degrees to move in one cycle
+const FIRE_SETTLE_MS   = 300;   // ms to track before firing (let servo settle)
+const FIRE_COOLDOWN_MS = 2000;  // ms to ignore motion after a shot
 
 let motionTrackerProcess  = null;
 let motionTrackingActive  = false;
 let motionTrackerBuffer   = "";
+
+// Fire-and-cooldown state
+let motionCooldown      = false;  // true while in post-fire sleep
+let motionCooldownTimer = null;   // clearTimeout handle
+let motionSettleTimer   = null;   // clearTimeout handle for pre-fire settle delay
+let motionBoutActive    = false;  // true while motion is currently detected
 
 function stopMotionTracking() {
   if (motionTrackerProcess) {
@@ -944,6 +803,10 @@ function stopMotionTracking() {
   }
   motionTrackingActive = false;
   motionTrackerBuffer  = "";
+  motionCooldown       = false;
+  motionBoutActive     = false;
+  if (motionCooldownTimer) { clearTimeout(motionCooldownTimer); motionCooldownTimer = null; }
+  if (motionSettleTimer)   { clearTimeout(motionSettleTimer);   motionSettleTimer   = null; }
 }
 
 function startMotionTracking() {
@@ -954,6 +817,8 @@ function startMotionTracking() {
   });
   motionTrackingActive = true;
   motionTrackerBuffer  = "";
+  motionCooldown       = false;
+  motionBoutActive     = false;
 
   motionTrackerProcess.stderr.on("data", (d) =>
     console.error("[MotionTracker stderr]", d.toString().trim())
@@ -983,7 +848,17 @@ function startMotionTracking() {
         return;
       }
 
-      if (!msg.active) continue; // quiet frame — nothing to do
+      if (!msg.active) {
+        // Motion went quiet — cancel any pending settle timer
+        if (motionBoutActive) {
+          motionBoutActive = false;
+          if (motionSettleTimer) { clearTimeout(motionSettleTimer); motionSettleTimer = null; }
+        }
+        continue;
+      }
+
+      // ---- In cooldown — skip everything ----
+      if (motionCooldown) continue;
 
       // ---- Apply P-controller ----
       const offsetX = msg.cx - 0.5;
@@ -1010,11 +885,28 @@ function startMotionTracking() {
         }
       }
 
-      // ---- Face-detection refinement ----
-      if (msg.refine && (!faceTrackJob || faceTrackJob.status !== "running")) {
-        faceTrackJob = { status: "running", result: null };
-        // Fire-and-forget — _runFaceTrackInner handles camera stop/restart
-        runFaceTrack();
+      // ---- Schedule fire after settle delay (first frame of each bout only) ----
+      if (!motionBoutActive) {
+        motionBoutActive = true;
+        motionSettleTimer = setTimeout(async () => {
+          motionSettleTimer = null;
+          if (motionCooldown || !motionTrackingActive) return;
+          // Enter cooldown immediately so no further shots are queued
+          motionCooldown = true;
+          console.log("[MotionTracker] firing cannon");
+          try {
+            await fetch(`http://localhost:${PORT}/cicka?mode=pulse&ms=1500`, { cache: "no-store" });
+          } catch (e) {
+            console.error("[MotionTracker] fire error:", e.message);
+          }
+          // Release cooldown after FIRE_COOLDOWN_MS
+          motionCooldownTimer = setTimeout(() => {
+            motionCooldownTimer = null;
+            motionCooldown      = false;
+            motionBoutActive    = false;
+            console.log("[MotionTracker] cooldown over — armed");
+          }, FIRE_COOLDOWN_MS);
+        }, FIRE_SETTLE_MS);
       }
     }
   });
@@ -1029,14 +921,27 @@ function startMotionTracking() {
     motionTrackerProcess = null;
     motionTrackingActive = false;
     motionTrackerBuffer  = "";
+    motionCooldown       = false;
+    motionBoutActive     = false;
+    if (motionCooldownTimer) { clearTimeout(motionCooldownTimer); motionCooldownTimer = null; }
+    if (motionSettleTimer)   { clearTimeout(motionSettleTimer);   motionSettleTimer   = null; }
   });
 
   console.log("[MotionTracker] started");
 }
 
+// API: /motion-track/start
+app.get("/motion-track/start", (_req, res) => {
+  startMotionTracking();
+  res.json({ started: true });
+});
+
 // API: /motion-track/status
 app.get("/motion-track/status", (_req, res) => {
-  res.json({ active: motionTrackingActive });
+  res.json({
+    active:   motionTrackingActive,
+    cooldown: motionCooldown,
+  });
 });
 
 // API: /motion-track/stop
@@ -1104,51 +1009,28 @@ app.get("/ui", (_req, res) => {
           <div class="dpad-empty"></div>
         </div>
 
-        <!-- FIRE button + Find-face button -->
-        <div class="fire-wrap">
-          <!-- Face-track button: same design as FIRE, smiley face SVG -->
-          <div class="face-col">
-            <div class="face-guard" id="faceTrackBtn" role="button" title="Find face">
-              <svg class="face-svg" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
-                <!-- face circle outline -->
-                <circle cx="20" cy="20" r="17" stroke="currentColor" stroke-width="2.5" fill="none"/>
-                <!-- eyes -->
-                <circle class="face-eye" cx="13" cy="15" r="2.5" fill="currentColor"/>
-                <circle class="face-eye" cx="27" cy="15" r="2.5" fill="currentColor"/>
-                <!-- mouth: normal smile -->
-                <path class="face-smile" d="M12 24 Q20 32 28 24" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-                <!-- mouth: seeking — straight line, hidden by default -->
-                <path class="face-meh" d="M13 26 L27 26" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-                <!-- mouth: notfound — sad, hidden by default -->
-                <path class="face-sad" d="M12 28 Q20 20 28 28" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-                <!-- seeking: spinning scan arc, hidden by default -->
-                <circle class="face-scan" cx="20" cy="20" r="17" stroke="currentColor" stroke-width="3"
-                        fill="none" stroke-dasharray="28 80" stroke-linecap="round"/>
-              </svg>
+        <!-- FIRE button -->
+          <div class="fire-wrap">
+            <div class="fire-col">
+              <div class="fire-guard">
+                <button class="fire-btn" id="fireBtn">FIRE</button>
+              </div>
+              <span class="fire-label">&#9888; ARMED</span>
             </div>
-            <span class="face-label">SEEK</span>
           </div>
-
-          <div class="fire-col">
-            <div class="fire-guard">
-              <button class="fire-btn" id="fireBtn">FIRE</button>
-            </div>
-            <span class="fire-label">&#9888; ARMED</span>
-          </div>
-        </div>
       </div>
 
-      <!-- Actions bar: motion alert + tracking indicator -->
-      <div class="actions-bar">
-        <div class="alert-group">
-          <button class="alert-btn" id="alertBtn">🔔 MOTION ALERT</button>
+      <!-- Actions bar: motion alert + AUTO tracking toggle -->
+        <div class="actions-bar">
+          <div class="alert-group">
+            <button class="alert-btn" id="alertBtn">🔔 MOTION ALERT</button>
+          </div>
+          <!-- AUTO toggle — starts/stops motion-tracking auto-fire -->
+          <div class="track-group" id="trackGroup">
+            <button class="track-auto-btn" id="trackAutoBtn" data-state="off">&#9654; AUTO</button>
+            <div class="track-status" id="trackStatus"></div>
+          </div>
         </div>
-        <!-- Motion tracking indicator — hidden when not tracking -->
-        <div class="track-group hidden" id="trackGroup">
-          <div class="track-indicator" id="trackIndicator">&#9654; TRACKING</div>
-          <button class="track-stop-btn" id="trackStopBtn">&#9632; STOP</button>
-        </div>
-      </div>
 
       <!-- Watering controls -->
       <div class="watering-bar">
@@ -1398,116 +1280,9 @@ app.get("/ui", (_req, res) => {
     waterOnBtn.addEventListener("click", startWatering);
     waterOffBtn.addEventListener("click", stopWatering);
 
-     // ---- Crosshair + face-detection overlay ----
+     // ---- Crosshair ----
      const crosshairCanvas = document.getElementById("crosshairCanvas");
      const crosshairCtx = crosshairCanvas.getContext("2d");
-
-     // Last face-detect result to overlay; cleared after FACE_BOX_LINGER_MS
-     let faceBox = null;           // { bx,by,bw,bh,label,score } all normalised 0-1
-     let faceBoxTimer = null;
-     const FACE_BOX_LINGER_MS = 4000;
-
-     function clearFaceBox() {
-       faceBox = null;
-       if (faceBoxTimer) { clearTimeout(faceBoxTimer); faceBoxTimer = null; }
-       drawCrosshair(false);
-     }
-
-     function showFaceBox(data) {
-       if (faceBoxTimer) clearTimeout(faceBoxTimer);
-       faceBox = data.found ? data : null;
-       drawCrosshair(false);
-       if (faceBox) {
-         faceBoxTimer = setTimeout(clearFaceBox, FACE_BOX_LINGER_MS);
-       }
-     }
-
-     function drawFaceBox(canvasW, canvasH) {
-       if (!faceBox) return;
-       const { bx, by, bw, bh, label, score, w: frameW, h: frameH } = faceBox;
-
-       const natW = frameW || canvasW;
-       const natH = frameH || canvasH;
-       const imgAspect    = natW / natH;
-       const canvasAspect = canvasW / canvasH;
-
-       let imgW, imgH, imgX, imgY;
-       if (imgAspect > canvasAspect) {
-         imgW = canvasW;
-         imgH = canvasW / imgAspect;
-         imgX = 0;
-         imgY = (canvasH - imgH) / 2;
-       } else {
-         imgH = canvasH;
-         imgW = canvasH * imgAspect;
-         imgX = (canvasW - imgW) / 2;
-         imgY = 0;
-       }
-
-       const px = imgX + bx * imgW;
-       const py = imgY + by * imgH;
-       const pw = bw * imgW;
-       const ph = bh * imgH;
-
-       const isCat = label === "cat";
-       const boxColor  = isCat ? "rgba(255,200,0,0.95)"  : "rgba(0,220,255,0.95)";
-       const glowColor = isCat ? "#ffc800"                : "#00dcff";
-       const bracketLen = Math.min(pw, ph) * 0.28;
-       const lw = 2.5;
-
-       crosshairCtx.strokeStyle = boxColor;
-       crosshairCtx.lineWidth   = lw;
-       crosshairCtx.shadowColor = glowColor;
-       crosshairCtx.shadowBlur  = 10;
-
-       // Corner brackets — TL, TR, BL, BR
-       [
-         [px,      py,      1,  1],
-         [px + pw, py,     -1,  1],
-         [px,      py + ph, 1, -1],
-         [px + pw, py + ph,-1, -1],
-       ].forEach(([ox, oy, sx, sy]) => {
-         crosshairCtx.beginPath();
-         crosshairCtx.moveTo(ox + sx * bracketLen, oy);
-         crosshairCtx.lineTo(ox, oy);
-         crosshairCtx.lineTo(ox, oy + sy * bracketLen);
-         crosshairCtx.stroke();
-       });
-
-       // Centre dot
-       const dotX = px + pw / 2;
-       const dotY = py + ph / 2;
-       crosshairCtx.beginPath();
-       crosshairCtx.arc(dotX, dotY, lw * 1.5, 0, Math.PI * 2);
-       crosshairCtx.fillStyle = boxColor;
-       crosshairCtx.shadowBlur = 8;
-       crosshairCtx.fill();
-
-       // Label + score pill above the box
-       const labelText = label.toUpperCase() + "  " + Math.round(score * 100) + "%";
-       const fontSize  = Math.max(11, Math.min(16, pw * 0.18));
-       crosshairCtx.font         = "bold " + fontSize + "px monospace";
-       crosshairCtx.shadowBlur   = 0;
-       const textW = crosshairCtx.measureText(labelText).width;
-       const padX = 6, padY = 4;
-       const pillX = px;
-       const pillY = py - fontSize - padY * 2 - 2;
-       // pill background
-       crosshairCtx.fillStyle = "rgba(0,0,0,0.55)";
-       crosshairCtx.beginPath();
-       crosshairCtx.roundRect(pillX, pillY, textW + padX * 2, fontSize + padY * 2, 4);
-       crosshairCtx.fill();
-       // pill border
-       crosshairCtx.strokeStyle = boxColor;
-       crosshairCtx.lineWidth   = 1;
-       crosshairCtx.stroke();
-       // text
-       crosshairCtx.fillStyle  = boxColor;
-       crosshairCtx.shadowColor = glowColor;
-       crosshairCtx.shadowBlur  = 6;
-       crosshairCtx.fillText(labelText, pillX + padX, pillY + fontSize + padY - 1);
-       crosshairCtx.shadowBlur = 0;
-     }
 
      // cx/cy in canvas pixels — normally center, offset while dragging
      let chX = null, chY = null;
@@ -1524,9 +1299,6 @@ app.get("/ui", (_req, res) => {
        const color = flash ? "rgba(255,80,80,0.95)" : "rgba(0,255,80,0.85)";
 
        crosshairCtx.clearRect(0, 0, w, h);
-
-       // Face detection box (drawn first, behind crosshair)
-       drawFaceBox(w, h);
 
        // If dragging, draw a faint line from center to crosshair
        if (ox != null && oy != null) {
@@ -1672,137 +1444,65 @@ app.get("/ui", (_req, res) => {
         }
       });
 
-    // ---- Face tracking ----
-    const faceTrackBtn = document.getElementById("faceTrackBtn");
+    // ---- AUTO motion-tracking toggle ----
+    const trackAutoBtn = document.getElementById("trackAutoBtn");
+    const trackStatus  = document.getElementById("trackStatus");
+    let trackingActive = false;
+    let trackingCooldown = false;
+    let trackStatusInterval = null;
 
-    // Initialise the switch to SAFE position
-    faceTrackBtn.dataset.state = "safe";
-
-    // ---- Face tracking — fire-and-poll ----
-    // SEEK keeps re-scanning until a face is found, then fires and stops.
-    // Clicking SEEK again while active cancels the loop.
-    let faceTrackPolling = null;
-
-    function stopFaceTrackPolling() {
-      if (faceTrackPolling !== null) {
-        clearInterval(faceTrackPolling);
-        faceTrackPolling = null;
-      }
-    }
-
-    function setSwitch(state) { faceTrackBtn.dataset.state = state; }
-
-    async function kickFaceScan() {
-      try {
-        const kickoff = await fetch(apiBase() + "/face-track", { cache: "no-store" });
-        const kickData = await kickoff.json();
-        if (kickData.status !== "started" && kickData.status !== "busy") {
-          throw new Error("Unexpected kickoff response: " + JSON.stringify(kickData));
-        }
-      } catch (e) {
-        console.error("FaceTrack kickoff error:", e);
-        setSwitch("safe");
-        stopFaceTrackPolling();
-      }
-    }
-
-    function startFaceTrackPoll() {
-      stopFaceTrackPolling();
-      faceTrackPolling = setInterval(async () => {
-        // If user cancelled manually, stop
-        if (faceTrackBtn.dataset.state === "safe") { stopFaceTrackPolling(); return; }
-        try {
-          const r = await fetch(apiBase() + "/face-track/result", { cache: "no-store" });
-          const d = await r.json();
-          if (d.status === "pending") return; // still scanning
-          onFaceTrackResult(d);
-        } catch (e) {
-          console.error("FaceTrack poll error:", e);
-          stopFaceTrackPolling();
-          setSwitch("safe");
-        }
-      }, 500);
-    }
-
-    function onFaceTrackResult(data) {
-      stopFaceTrackPolling();
-
-      if (data.error) {
-        // On error: if still seeking, retry after a short pause
-        if (faceTrackBtn.dataset.state === "seeking") {
-          setTimeout(() => { kickFaceScan(); startFaceTrackPoll(); }, 800);
-        }
-        return;
-      }
-
-      if (data.found) {
-        // Face found: show box, move servos, fire, then stop seeking
-        showFaceBox(data);
-        setSwitch("track");
-
-        fetch(apiBase() + "/face-track/move", { cache: "no-store" }).catch(e => {
-          console.error("FaceTrack move error:", e);
-        });
-
-        setTimeout(() => {
-          clearFaceBox();
-          setSwitch("safe");
-          fireCannon();
-        }, 500);
+    function setTrackingUI(active, cooldown) {
+      trackingActive   = active;
+      trackingCooldown = cooldown;
+      if (!active) {
+        trackAutoBtn.dataset.state = "off";
+        trackAutoBtn.textContent   = "\u25BA AUTO";
+        trackAutoBtn.classList.remove("auto-armed", "auto-cooldown");
+        trackStatus.textContent = "";
+      } else if (cooldown) {
+        trackAutoBtn.dataset.state = "cooldown";
+        trackAutoBtn.textContent   = "\u23F3 COOLDOWN";
+        trackAutoBtn.classList.remove("auto-armed");
+        trackAutoBtn.classList.add("auto-cooldown");
+        trackStatus.textContent = "";
       } else {
-        // Not found: immediately kick off another scan and keep seeking
-        if (faceTrackBtn.dataset.state === "seeking") {
-          kickFaceScan();
-          startFaceTrackPoll();
-        }
+        trackAutoBtn.dataset.state = "armed";
+        trackAutoBtn.textContent   = "\u25A0 ARMED";
+        trackAutoBtn.classList.add("auto-armed");
+        trackAutoBtn.classList.remove("auto-cooldown");
+        trackStatus.textContent = "";
       }
-    }
-
-    faceTrackBtn.addEventListener("click", async () => {
-      const state = faceTrackBtn.dataset.state;
-
-       // TRACK/SEEKING → SAFE: cancel everything
-       if (state === "track" || state === "seeking" || state === "notfound") {
-         stopFaceTrackPolling();
-         clearFaceBox();
-         setSwitch("safe");
-         return;
-       }
-
-      // SAFE → SEEK: start the continuous scan loop
-      setSwitch("seeking");
-      await kickFaceScan();
-      startFaceTrackPoll();
-    });
-
-    // ---- Motion tracking indicator ----
-    const trackGroup    = document.getElementById("trackGroup");
-    const trackStopBtn  = document.getElementById("trackStopBtn");
-    let trackingActive  = false;
-
-    function setTrackingUI(active) {
-      trackingActive = active;
-      trackGroup.classList.toggle("hidden", !active);
     }
 
     async function pollTrackingStatus() {
       try {
         const r = await fetch(apiBase() + "/motion-track/status", { cache: "no-store" });
         const d = await r.json();
-        setTrackingUI(!!d.active);
+        setTrackingUI(!!d.active, !!d.cooldown);
       } catch (_) {}
     }
 
-    trackStopBtn.addEventListener("click", async () => {
-      try {
-        await fetch(apiBase() + "/motion-track/stop", { cache: "no-store" });
-        setTrackingUI(false);
-      } catch (e) {
-        console.error("Track stop error:", e);
+    trackAutoBtn.addEventListener("click", async () => {
+      if (trackingActive) {
+        // Stop
+        try {
+          await fetch(apiBase() + "/motion-track/stop", { cache: "no-store" });
+          setTrackingUI(false, false);
+        } catch (e) {
+          console.error("Track stop error:", e);
+        }
+      } else {
+        // Start
+        try {
+          await fetch(apiBase() + "/motion-track/start", { cache: "no-store" });
+          setTrackingUI(true, false);
+        } catch (e) {
+          console.error("Track start error:", e);
+        }
       }
     });
 
-    // Poll tracking status every 1.5 s
+    // Poll tracking status every 1.5 s (picks up cooldown transitions)
     setInterval(pollTrackingStatus, 1500);
 
     // Auto-start camera on load

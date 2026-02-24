@@ -290,37 +290,47 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 .fire-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-/* ---- Motion tracking indicator ---- */
+/* ---- AUTO motion-tracking toggle ---- */
 .track-group {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 6px;
 }
-.track-indicator {
-  font-size: 13px;
-  color: #39ff14;
-  letter-spacing: 2px;
-  text-transform: uppercase;
-  animation: track-pulse 0.8s ease-in-out infinite;
-}
-@keyframes track-pulse {
-  0%, 100% { opacity: 1; }
-  50%       { opacity: 0.35; }
-}
-.track-stop-btn {
-  background: #555;
-  color: #ccc;
-  font-size: 12px;
-  padding: 6px 12px;
-  border-radius: 10px;
-  border: 2px solid #000;
+.track-auto-btn {
+  font-family: "Luckiest Guy", system-ui, sans-serif;
+  font-size: 15px;
+  padding: 10px 20px;
+  border-radius: 14px;
+  border: 3px solid #000;
   cursor: pointer;
-  box-shadow: 0 3px 0 #000;
-  transition: background 0.15s, transform 0.05s;
+  box-shadow: 0 4px 0 #000;
+  letter-spacing: 1px;
+  background: #444;
+  color: #aaa;
+  transition: background 0.15s, color 0.15s, transform 0.05s, box-shadow 0.05s;
 }
-.track-stop-btn:active { transform: translateY(3px); box-shadow: 0 0 0 #000; }
-.track-stop-btn:hover  { background: #e53935; color: #fff; }
+.track-auto-btn:active { transform: translateY(4px); box-shadow: 0 0 0 #000; }
+.track-auto-btn.auto-armed {
+  background: #1b5e20;
+  color: #39ff14;
+  box-shadow: 0 4px 0 #0a2e0f, 0 0 14px rgba(57,255,20,0.5);
+  animation: armed-pulse 1s ease-in-out infinite;
+}
+@keyframes armed-pulse {
+  0%, 100% { box-shadow: 0 4px 0 #0a2e0f, 0 0 6px  rgba(57,255,20,0.3); }
+  50%       { box-shadow: 0 4px 0 #0a2e0f, 0 0 18px rgba(57,255,20,0.9); }
+}
+.track-auto-btn.auto-cooldown {
+  background: #4a3000;
+  color: #ffd740;
+  box-shadow: 0 4px 0 #2a1a00, 0 0 12px rgba(255,215,64,0.4);
+  animation: cooldown-pulse 0.6s ease-in-out infinite;
+}
+@keyframes cooldown-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.55; }
+}
 
 /* ---- Watering bar ---- */
 .watering-bar {
@@ -376,116 +386,4 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   box-shadow: 0 4px 0 #222;
 }
 .water-off-btn:hover:not(:disabled) { background: #e53935; color: #fff; }
-
-.face-col {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
-}
-.face-guard {
-  position: relative;
-  width: 84px;
-  height: 84px;
-  border-radius: 50%;
-  background: radial-gradient(circle at 35% 35%, #5c6bc0, #1a237e);
-  border: 4px solid #000;
-  color: #fff;
-  cursor: pointer;
-  box-shadow: 0 6px 0 #0d1261, 0 0 20px rgba(92,107,192,0.5);
-  transition: background 0.2s;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  user-select: none;
-}
-.face-guard:active {
-  box-shadow: 0 2px 0 #0d1261, 0 0 28px rgba(92,107,192,0.9);
-}
-/* state colours */
-.face-guard[data-state="seeking"] {
-  background: radial-gradient(circle at 35% 35%, #ffd740, #f57f17);
-  box-shadow: 0 6px 0 #7a3e00, 0 0 20px rgba(255,215,64,0.5);
-}
-.face-guard[data-state="track"] {
-  background: radial-gradient(circle at 35% 35%, #69f0ae, #1b5e20);
-  box-shadow: 0 6px 0 #0a2e0f, 0 0 20px rgba(105,240,174,0.5);
-  color: #000;
-}
-.face-guard[data-state="notfound"] {
-  background: radial-gradient(circle at 35% 35%, #ff5252, #b71c1c);
-  box-shadow: 0 6px 0 #7f0000, 0 0 20px rgba(255,82,82,0.5);
-}
-/* guard arc — blue tint, mirrors FIRE's orange arc */
-.face-guard::before {
-  content: "";
-  position: absolute;
-  inset: -8px;
-  border-radius: 50%;
-  border: 5px solid #4A90E2;
-  border-bottom-color: transparent;
-  border-left-color: transparent;
-  transform: rotate(-45deg);
-  pointer-events: none;
-  box-shadow: 0 0 8px rgba(74,144,226,0.6);
-  transition: border-color 0.2s, box-shadow 0.2s;
-}
-.face-guard[data-state="seeking"]::before {
-  border-color: #ffdd00;
-  border-bottom-color: transparent;
-  border-left-color: transparent;
-  box-shadow: 0 0 12px rgba(255,221,0,0.7);
-}
-.face-guard[data-state="track"]::before {
-  border-color: #39ff14;
-  border-bottom-color: transparent;
-  border-left-color: transparent;
-  box-shadow: 0 0 12px rgba(57,255,20,0.7);
-}
-.face-guard[data-state="notfound"]::before {
-  border-color: #ff5252;
-  border-bottom-color: transparent;
-  border-left-color: transparent;
-  box-shadow: 0 0 12px rgba(255,82,82,0.7);
-}
-.face-svg {
-  width: 60%;
-  height: 60%;
-}
-/* mouth variants — only one visible at a time */
-.face-meh, .face-sad { display: none; }
-.face-guard[data-state="seeking"] .face-smile,
-.face-guard[data-state="seeking"] .face-sad   { display: none; }
-.face-guard[data-state="seeking"] .face-meh   { display: block; }
-.face-guard[data-state="notfound"] .face-smile,
-.face-guard[data-state="notfound"] .face-meh  { display: none; }
-.face-guard[data-state="notfound"] .face-sad  { display: block; }
-/* scan arc only visible while seeking */
-.face-scan { display: none; }
-.face-guard[data-state="seeking"] .face-scan {
-  display: block;
-  transform-origin: 20px 20px;
-  animation: face-spin 1s linear infinite;
-}
-@keyframes face-spin { to { transform: rotate(360deg); } }
-/* seeking pulse — box-shadow only, no filter (filter creates compositing layer
-   that breaks hit-testing on siblings in mobile WebKit) */
-.face-guard[data-state="seeking"] {
-  animation: face-seek-pulse 0.9s ease-in-out infinite;
-}
-@keyframes face-seek-pulse {
-  0%,100% { box-shadow: 0 6px 0 #7a3e00, 0 0 4px  rgba(255,221,0,0.2); }
-  50%      { box-shadow: 0 6px 0 #7a3e00, 0 0 20px rgba(255,221,0,0.9); }
-}
-.face-label {
-  font-size: 10px;
-  color: #4A90E2;
-  letter-spacing: 2px;
-  text-transform: uppercase;
-  transition: color 0.2s;
-}
-.face-col:has([data-state="seeking"]) .face-label,
-.face-guard[data-state="seeking"] ~ .face-label  { color: #ffdd00; }
-.face-col:has([data-state="track"])   .face-label  { color: #39ff14; }
-.face-col:has([data-state="notfound"]) .face-label { color: #ff5252; }
 

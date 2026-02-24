@@ -9,8 +9,6 @@ Output protocol (stdout, one JSON line per cycle):
   {"active": true,  "cx": 0.52, "cy": 0.38, "area": 14500}
       → motion detected; cx/cy are normalised (0–1) centroid of the largest
         moving region.
-  {"active": true,  "cx": …, "cy": …, "area": …, "refine": true}
-      → same, but also request a face-detection refinement pass from Node.
   {"active": false}
       → no motion this cycle (or motion just stopped).
   {"ready": true}
@@ -51,8 +49,6 @@ FRAME_GAP       = 2
 DETECT_SCALE    = 0.5
 # How long (seconds) motion must be absent before we declare tracking inactive
 QUIET_DEBOUNCE_S = 3.0
-# How often (seconds) to emit a "refine: true" request for face detection
-REFINE_INTERVAL_S = 4.0
 # Maximum frames/sec we feed through (soft cap — don't spin faster than needed)
 MAX_FPS         = 10
 
@@ -106,7 +102,6 @@ def run():
   ready_sent   = False
 
   last_motion_t   = 0.0
-  last_refine_t   = 0.0
   motion_active   = False
 
   # Frame rate limiter
@@ -154,13 +149,10 @@ def run():
 
       contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-      if contours:
-        largest = max(contours, key=cv2.contourArea)
-        area    = cv2.contourArea(largest)
-      else:
-        area = 0
+      largest = max(contours, key=cv2.contourArea) if contours else None
+      area    = cv2.contourArea(largest) if largest is not None else 0
 
-      if area >= MIN_AREA:
+      if area >= MIN_AREA and largest is not None:
         last_motion_t = now
         motion_active = True
 
@@ -179,16 +171,8 @@ def run():
         cx = cx_px / sw
         cy = cy_px / sh
 
-        # Request a face-detection refinement periodically
-        refine = (now - last_refine_t) >= REFINE_INTERVAL_S
-        if refine:
-          last_refine_t = now
-
-        obj = {"active": True, "cx": round(cx, 4), "cy": round(cy, 4),
-               "area": int(area)}
-        if refine:
-          obj["refine"] = True
-        emit(obj)
+        emit({"active": True, "cx": round(cx, 4), "cy": round(cy, 4),
+              "area": int(area)})
 
       else:
         # Declare inactive only after debounce period

@@ -37,7 +37,7 @@ import cv2
 # ---- Config from env ----
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-STREAM_URL       = "http://localhost:3000/camera/stream"
+STREAM_URL       = "http://localhost:3000/camera/stream?src=tracker"
 
 args = sys.argv[1:]
 while args:

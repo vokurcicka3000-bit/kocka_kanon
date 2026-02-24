@@ -290,6 +290,82 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 .fire-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+/* ---- SEEK (face-track) button ---- */
+.face-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+.face-guard {
+  position: relative;
+  width: 84px;
+  height: 84px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 35%, #29b6f6, #01579b);
+  border: 4px solid #000;
+  cursor: pointer;
+  box-shadow: 0 6px 0 #003060, 0 0 18px rgba(41,182,246,0.4);
+  transition: transform 0.05s ease, box-shadow 0.05s ease, background 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+}
+.face-guard:active {
+  transform: translateY(6px);
+  box-shadow: 0 0 0 #003060, 0 0 28px rgba(41,182,246,0.8);
+}
+/* seeking state: cyan pulse */
+.face-guard[data-state="seeking"] {
+  background: radial-gradient(circle at 35% 35%, #00e5ff, #006064);
+  box-shadow: 0 6px 0 #003040, 0 0 22px rgba(0,229,255,0.7);
+  animation: seek-pulse 0.9s ease-in-out infinite;
+}
+/* face found state: green flash */
+.face-guard[data-state="track"] {
+  background: radial-gradient(circle at 35% 35%, #69ff47, #1b5e20);
+  box-shadow: 0 6px 0 #0a2e0f, 0 0 24px rgba(105,255,71,0.8);
+}
+@keyframes seek-pulse {
+  0%, 100% { box-shadow: 0 6px 0 #003040, 0 0 10px rgba(0,229,255,0.4); }
+  50%       { box-shadow: 0 6px 0 #003040, 0 0 26px rgba(0,229,255,1);   }
+}
+.face-svg {
+  width: 48px;
+  height: 48px;
+  color: #fff;
+  overflow: visible;
+}
+/* hide non-default mouth/scan states by default */
+.face-meh, .face-sad, .face-scan { display: none; }
+
+/* seeking: hide smile, show meh + spinning scan ring */
+.face-guard[data-state="seeking"] .face-smile { display: none; }
+.face-guard[data-state="seeking"] .face-meh   { display: block; }
+.face-guard[data-state="seeking"] .face-scan  {
+  display: block;
+  transform-origin: 20px 20px;
+  animation: spin-scan 1s linear infinite;
+}
+/* track (found): keep smile visible — face was found, happy! */
+/* eyes: hide when seeking to look more robotic */
+.face-guard[data-state="seeking"] .face-eye { opacity: 0.3; }
+@keyframes spin-scan {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+.face-label {
+  font-size: 10px;
+  color: #29b6f6;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  font-family: "Luckiest Guy", system-ui, sans-serif;
+  transition: color 0.2s;
+}
+.face-guard[data-state="seeking"] + .face-label { color: #00e5ff; }
+.face-guard[data-state="track"]   + .face-label { color: #69ff47; }
+
 /* ---- AUTO motion-tracking toggle ---- */
 .track-group {
   display: flex;

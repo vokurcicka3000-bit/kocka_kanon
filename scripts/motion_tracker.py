@@ -9,12 +9,14 @@ Output protocol (stdout, one JSON line per cycle):
   {"active": true,  "cx": 0.52, "cy": 0.38, "area": 14500}
       → motion detected; cx/cy are normalised (0–1) centroid of the largest
         moving region.
+  {"active": true,  "cx": …, "cy": …, "area": …, "refine": true}
+      → same, but also request a face-detection refinement pass from Node.
   {"active": false}
       → no motion this cycle (or motion just stopped).
   {"ready": true}
       → stream connected, first frame decoded.
   {"error": "<msg>"}
-      → fatal error; script will exit.
+      → non-fatal stream error; script will attempt to reconnect.
 
 Usage:
   python3 motion_tracker.py [stream_url]
@@ -31,7 +33,7 @@ import numpy as np
 import cv2
 
 # ---- Config ----
-STREAM_URL      = "http://localhost:3000/camera/stream"
+STREAM_URL      = "http://localhost:3000/camera/stream?src=tracker"
 
 args = sys.argv[1:]
 while args:
@@ -49,8 +51,12 @@ FRAME_GAP       = 2
 DETECT_SCALE    = 0.5
 # How long (seconds) motion must be absent before we declare tracking inactive
 QUIET_DEBOUNCE_S = 3.0
+# How often (seconds) to emit a "refine: true" request for face detection
+REFINE_INTERVAL_S = 4.0
 # Maximum frames/sec we feed through (soft cap — don't spin faster than needed)
 MAX_FPS         = 10
+# How long to wait between reconnect attempts when the stream is unavailable
+RECONNECT_WAIT_S = 2.0
 
 
 def emit(obj):
@@ -81,111 +87,129 @@ def iter_mjpeg_frames(url, timeout=20):
 
 
 def wait_for_stream():
-  for _ in range(30):
+  """Poll until the stream responds. Returns when ready; never gives up."""
+  while True:
     try:
       urllib.request.urlopen(STREAM_URL, timeout=2).close()
       return
     except Exception:
-      time.sleep(0.5)
-  emit({"error": "could not connect to MJPEG stream"})
-  sys.exit(1)
+      time.sleep(RECONNECT_WAIT_S)
 
 
 def run():
   # Graceful shutdown on SIGTERM
   signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
-  wait_for_stream()
-
   morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-  ring         = []      # ring buffer of recent downscaled+blurred frames
-  ready_sent   = False
-
-  last_motion_t   = 0.0
-  motion_active   = False
 
   # Frame rate limiter
-  frame_interval  = 1.0 / MAX_FPS
-  last_frame_t    = 0.0
+  frame_interval = 1.0 / MAX_FPS
 
-  try:
-    for jpeg in iter_mjpeg_frames(STREAM_URL):
-      now = time.monotonic()
+  while True:  # outer reconnect loop
+    wait_for_stream()
 
-      # Soft frame-rate cap — drop frames we can't process in time
-      if now - last_frame_t < frame_interval:
-        continue
-      last_frame_t = now
+    ring         = []
+    ready_sent   = False
+    last_motion_t   = 0.0
+    last_refine_t   = 0.0
+    motion_active   = False
+    last_frame_t    = 0.0
 
-      arr   = np.frombuffer(jpeg, dtype=np.uint8)
-      frame = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
-      if frame is None:
-        continue
+    try:
+      for jpeg in iter_mjpeg_frames(STREAM_URL):
+        now = time.monotonic()
 
-      h, w = frame.shape
+        # Soft frame-rate cap — drop frames we can't process in time
+        if now - last_frame_t < frame_interval:
+          continue
+        last_frame_t = now
 
-      if not ready_sent:
-        emit({"ready": True})
-        ready_sent = True
+        arr   = np.frombuffer(jpeg, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        if frame is None:
+          continue
 
-      # Downsample + blur to reduce noise
-      sw = max(1, int(w * DETECT_SCALE))
-      sh = max(1, int(h * DETECT_SCALE))
-      small = cv2.resize(frame, (sw, sh))
-      small = cv2.GaussianBlur(small, (7, 7), 0)
+        h, w = frame.shape
 
-      ring.append(small)
-      if len(ring) <= FRAME_GAP:
-        continue
-      if len(ring) > FRAME_GAP + 1:
-        ring.pop(0)
+        if not ready_sent:
+          emit({"ready": True})
+          ready_sent = True
 
-      ref  = ring[0]
-      curr = ring[-1]
-      diff = cv2.absdiff(curr, ref)
-      _, mask = cv2.threshold(diff, DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
-      mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, morph_kernel)
-      mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  morph_kernel)
+        # Downsample + blur to reduce noise
+        sw = max(1, int(w * DETECT_SCALE))
+        sh = max(1, int(h * DETECT_SCALE))
+        small = cv2.resize(frame, (sw, sh))
+        small = cv2.GaussianBlur(small, (7, 7), 0)
 
-      contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        ring.append(small)
+        if len(ring) <= FRAME_GAP:
+          continue
+        if len(ring) > FRAME_GAP + 1:
+          ring.pop(0)
 
-      largest = max(contours, key=cv2.contourArea) if contours else None
-      area    = cv2.contourArea(largest) if largest is not None else 0
+        ref  = ring[0]
+        curr = ring[-1]
+        diff = cv2.absdiff(curr, ref)
+        _, mask = cv2.threshold(diff, DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, morph_kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  morph_kernel)
 
-      if area >= MIN_AREA and largest is not None:
-        last_motion_t = now
-        motion_active = True
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Centroid of the largest contour in detection-scale pixels
-        M   = cv2.moments(largest)
-        if M["m00"] > 0:
-          cx_px = M["m10"] / M["m00"]
-          cy_px = M["m01"] / M["m00"]
+        largest = None
+        if contours:
+          largest = max(contours, key=cv2.contourArea)
+          area    = cv2.contourArea(largest)
         else:
-          x, y, bw, bh = cv2.boundingRect(largest)
-          cx_px = x + bw / 2
-          cy_px = y + bh / 2
+          area = 0
 
-        # Normalise to 0–1 (detection scale → original scale doesn't matter since
-        # both numerator and denominator are in the same coordinate space)
-        cx = cx_px / sw
-        cy = cy_px / sh
+        if area >= MIN_AREA and largest is not None:
+          last_motion_t = now
+          motion_active = True
 
-        emit({"active": True, "cx": round(cx, 4), "cy": round(cy, 4),
-              "area": int(area)})
+          # Centroid of the largest contour in detection-scale pixels
+          M   = cv2.moments(largest)
+          if M["m00"] > 0:
+            cx_px = M["m10"] / M["m00"]
+            cy_px = M["m01"] / M["m00"]
+          else:
+            x, y, bw, bh = cv2.boundingRect(largest)
+            cx_px = x + bw / 2
+            cy_px = y + bh / 2
 
-      else:
-        # Declare inactive only after debounce period
-        if motion_active and (now - last_motion_t) >= QUIET_DEBOUNCE_S:
-          motion_active = False
-        emit({"active": False})
+          # Normalise to 0–1 (detection scale → original scale doesn't matter since
+          # both numerator and denominator are in the same coordinate space)
+          cx = cx_px / sw
+          cy = cy_px / sh
 
-  except (BrokenPipeError, KeyboardInterrupt, SystemExit):
-    pass
-  except Exception as e:
-    emit({"error": str(e)})
-    sys.exit(1)
+          # Request a face-detection refinement periodically
+          refine = (now - last_refine_t) >= REFINE_INTERVAL_S
+          if refine:
+            last_refine_t = now
+
+          obj = {"active": True, "cx": round(cx, 4), "cy": round(cy, 4),
+                 "area": int(area)}
+          if refine:
+            obj["refine"] = True
+          emit(obj)
+
+        else:
+          # Declare inactive only after debounce period
+          if motion_active and (now - last_motion_t) >= QUIET_DEBOUNCE_S:
+            motion_active = False
+          emit({"active": False})
+
+    except (BrokenPipeError, KeyboardInterrupt, SystemExit):
+      raise  # propagate fatal signals
+    except Exception as e:
+      # Stream dropped (camera stopped, network hiccup, etc.) — reconnect
+      emit({"error": str(e)})
+      time.sleep(RECONNECT_WAIT_S)
+      # continue outer loop → wait_for_stream() → reconnect
 
 
 if __name__ == "__main__":
-  run()
+  try:
+    run()
+  except (KeyboardInterrupt, SystemExit):
+    pass

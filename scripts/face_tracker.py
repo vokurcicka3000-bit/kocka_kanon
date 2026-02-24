@@ -29,7 +29,7 @@ YUNET_MODEL      = os.path.join(SCRIPT_DIR, "face_detection_yunet_2023mar.onnx")
 CASCADE_DIR      = "/usr/share/opencv4/haarcascades"
 CAT_CASCADE_PATH = os.path.join(CASCADE_DIR, "haarcascade_frontalcatface_extended.xml")
 
-STREAM_URL       = "http://localhost:3000/camera/stream"
+STREAM_URL       = "http://localhost:3000/camera/stream?src=tracker"
 STREAM_TIMEOUT   = 10   # seconds to wait for first frame
 YUNET_THRESHOLD  = 0.5
 DETECT_W         = 640  # downscale to this width before detection (faster on Pi)

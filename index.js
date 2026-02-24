@@ -827,6 +827,7 @@ async function _runFaceTrackInner() {
         bx: result.bx, by: result.by, bw: result.bw, bh: result.bh,
         dx: 0, dy: 0, moved: false,
       },
+      pendingMove: null,
     };
     return;
   }
@@ -839,28 +840,21 @@ async function _runFaceTrackInner() {
   const newH = needsH ? Math.max(SERVO_MIN, Math.min(SERVO_MAX, Math.round(state.horizontal + dH))) : state.horizontal;
   const newV = needsV ? Math.max(SERVO_MIN, Math.min(SERVO_MAX, Math.round(state.vertical   + dV))) : state.vertical;
 
-  try {
-    const cmds = [];
-    if (newH !== state.horizontal) cmds.push(servoCmd(`SET ${SERVO_H_CHANNEL} ${newH}`));
-    if (newV !== state.vertical)   cmds.push(servoCmd(servoSetCmd(SERVO_V_CHANNEL, newV)));
-    if (cmds.length) await Promise.all(cmds);
-    writeServoState(newH, newV);
-    faceTrackJob = {
-      status: "done",
-      result: {
-        found: true,
-        label: result.label,
-        cx: result.cx, cy: result.cy,
-        bx: result.bx, by: result.by, bw: result.bw, bh: result.bh,
-        dx: newH - state.horizontal,
-        dy: newV - state.vertical,
-        moved: cmds.length > 0,
-      },
-    };
-  } catch (err) {
-    console.error("[FaceTrack] servo error:", err);
-    faceTrackJob = { status: "done", result: { error: err.message } };
-  }
+  // Store the intended move but don't execute yet — client will call /face-track/move
+  // after showing the detection box for 1 second.
+  faceTrackJob = {
+    status: "done",
+    result: {
+      found: true,
+      label: result.label,
+      cx: result.cx, cy: result.cy,
+      bx: result.bx, by: result.by, bw: result.bw, bh: result.bh,
+      dx: newH - state.horizontal,
+      dy: newV - state.vertical,
+      moved: false,
+    },
+    pendingMove: { newH, newV },
+  };
 }
 
 app.get("/face-track", (req, res) => {
@@ -880,6 +874,29 @@ app.get("/face-track/result", (req, res) => {
   }
   // Return the result (status:"done" is implicit — client gets the raw result object)
   res.json(faceTrackJob.result);
+});
+
+// Execute the deferred servo move stored by /face-track.
+// Called by the client after showing the detection box for 1 second.
+app.get("/face-track/move", async (req, res) => {
+  if (!faceTrackJob || !faceTrackJob.pendingMove) {
+    res.json({ moved: false });
+    return;
+  }
+  const { newH, newV } = faceTrackJob.pendingMove;
+  faceTrackJob.pendingMove = null;
+  const state = readServoState();
+  try {
+    const cmds = [];
+    if (newH !== state.horizontal) cmds.push(servoCmd(`SET ${SERVO_H_CHANNEL} ${newH}`));
+    if (newV !== state.vertical)   cmds.push(servoCmd(servoSetCmd(SERVO_V_CHANNEL, newV)));
+    if (cmds.length) await Promise.all(cmds);
+    writeServoState(newH, newV);
+    res.json({ moved: cmds.length > 0 });
+  } catch (err) {
+    console.error("[FaceTrack/move] servo error:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // -------------------- Motion Tracking --------------------
@@ -1287,67 +1304,154 @@ app.get("/ui", (_req, res) => {
     }
     document.getElementById("fireBtn").addEventListener("click", fireCannon);
 
-    // ---- Crosshair overlay ----
-    const crosshairCanvas = document.getElementById("crosshairCanvas");
-    const crosshairCtx = crosshairCanvas.getContext("2d");
+     // ---- Crosshair + face-detection overlay ----
+     const crosshairCanvas = document.getElementById("crosshairCanvas");
+     const crosshairCtx = crosshairCanvas.getContext("2d");
 
-    // cx/cy in canvas pixels — normally center, offset while dragging
-    let chX = null, chY = null;
+     // Last face-detect result to overlay; cleared after FACE_BOX_LINGER_MS
+     let faceBox = null;           // { bx,by,bw,bh,label,score } all normalised 0-1
+     let faceBoxTimer = null;
+     const FACE_BOX_LINGER_MS = 4000;
 
-    function drawCrosshair(flash, ox, oy) {
-      const w = crosshairCanvas.width  = crosshairCanvas.offsetWidth;
-      const h = crosshairCanvas.height = crosshairCanvas.offsetHeight;
-      // Default to center
-      const cx = (ox != null) ? ox : w / 2;
-      const cy = (oy != null) ? oy : h / 2;
-      const gap = Math.min(w, h) * 0.045;
-      const arm = Math.min(w, h) * 0.13;
-      const r   = Math.min(w, h) * 0.055;
-      const color = flash ? "rgba(255,80,80,0.95)" : "rgba(0,255,80,0.85)";
+     function clearFaceBox() {
+       faceBox = null;
+       if (faceBoxTimer) { clearTimeout(faceBoxTimer); faceBoxTimer = null; }
+       drawCrosshair(false);
+     }
 
-      crosshairCtx.clearRect(0, 0, w, h);
+     function showFaceBox(data) {
+       if (faceBoxTimer) clearTimeout(faceBoxTimer);
+       faceBox = data.found ? data : null;
+       drawCrosshair(false);
+       if (faceBox) {
+         faceBoxTimer = setTimeout(clearFaceBox, FACE_BOX_LINGER_MS);
+       }
+     }
 
-      // If dragging, draw a faint line from center to crosshair
-      if (ox != null && oy != null) {
-        crosshairCtx.beginPath();
-        crosshairCtx.moveTo(w / 2, h / 2);
-        crosshairCtx.lineTo(cx, cy);
-        crosshairCtx.strokeStyle = "rgba(0,255,80,0.25)";
-        crosshairCtx.lineWidth = 1;
-        crosshairCtx.shadowBlur = 0;
-        crosshairCtx.stroke();
-      }
+     function drawFaceBox(w, h) {
+       if (!faceBox) return;
+       const { bx, by, bw, bh, label, score } = faceBox;
+       const px = bx * w, py = by * h, pw = bw * w, ph = bh * h;
+       const isCat = label === "cat";
+       const boxColor  = isCat ? "rgba(255,200,0,0.95)"  : "rgba(0,220,255,0.95)";
+       const glowColor = isCat ? "#ffc800"                : "#00dcff";
+       const bracketLen = Math.min(pw, ph) * 0.28;
+       const lw = 2.5;
 
-      crosshairCtx.strokeStyle = color;
-      crosshairCtx.lineWidth = 2;
-      crosshairCtx.shadowColor = flash ? "#ff2020" : "#00ff50";
-      crosshairCtx.shadowBlur = 6;
+       crosshairCtx.strokeStyle = boxColor;
+       crosshairCtx.lineWidth   = lw;
+       crosshairCtx.shadowColor = glowColor;
+       crosshairCtx.shadowBlur  = 10;
 
-      // Center circle
-      crosshairCtx.beginPath();
-      crosshairCtx.arc(cx, cy, r, 0, Math.PI * 2);
-      crosshairCtx.stroke();
+       // Corner brackets — TL, TR, BL, BR
+       [
+         [px,      py,      1,  1],
+         [px + pw, py,     -1,  1],
+         [px,      py + ph, 1, -1],
+         [px + pw, py + ph,-1, -1],
+       ].forEach(([ox, oy, sx, sy]) => {
+         crosshairCtx.beginPath();
+         crosshairCtx.moveTo(ox + sx * bracketLen, oy);
+         crosshairCtx.lineTo(ox, oy);
+         crosshairCtx.lineTo(ox, oy + sy * bracketLen);
+         crosshairCtx.stroke();
+       });
 
-      // Four arms
-      [[cx, cy - gap, cx, cy - gap - arm],
-       [cx, cy + gap, cx, cy + gap + arm],
-       [cx - gap, cy, cx - gap - arm, cy],
-       [cx + gap, cy, cx + gap + arm, cy]].forEach(([x1,y1,x2,y2]) => {
-        crosshairCtx.beginPath();
-        crosshairCtx.moveTo(x1, y1);
-        crosshairCtx.lineTo(x2, y2);
-        crosshairCtx.stroke();
-      });
-    }
+       // Centre dot
+       const dotX = (bx + bw / 2) * w;
+       const dotY = (by + bh / 2) * h;
+       crosshairCtx.beginPath();
+       crosshairCtx.arc(dotX, dotY, lw * 1.5, 0, Math.PI * 2);
+       crosshairCtx.fillStyle = boxColor;
+       crosshairCtx.shadowBlur = 8;
+       crosshairCtx.fill();
 
-    drawCrosshair(false);
-    window.addEventListener("resize", () => drawCrosshair(false));
-    videoStream.addEventListener("load", () => drawCrosshair(false));
+       // Label + score pill above the box
+       const labelText = label.toUpperCase() + "  " + Math.round(score * 100) + "%";
+       const fontSize  = Math.max(11, Math.min(16, pw * 0.18));
+       crosshairCtx.font         = "bold " + fontSize + "px monospace";
+       crosshairCtx.shadowBlur   = 0;
+       const textW = crosshairCtx.measureText(labelText).width;
+       const padX = 6, padY = 4;
+       const pillX = px;
+       const pillY = py - fontSize - padY * 2 - 2;
+       // pill background
+       crosshairCtx.fillStyle = "rgba(0,0,0,0.55)";
+       crosshairCtx.beginPath();
+       crosshairCtx.roundRect(pillX, pillY, textW + padX * 2, fontSize + padY * 2, 4);
+       crosshairCtx.fill();
+       // pill border
+       crosshairCtx.strokeStyle = boxColor;
+       crosshairCtx.lineWidth   = 1;
+       crosshairCtx.stroke();
+       // text
+       crosshairCtx.fillStyle  = boxColor;
+       crosshairCtx.shadowColor = glowColor;
+       crosshairCtx.shadowBlur  = 6;
+       crosshairCtx.fillText(labelText, pillX + padX, pillY + fontSize + padY - 1);
+       crosshairCtx.shadowBlur = 0;
+     }
 
-    function flashCrosshair() {
-      drawCrosshair(true);
-      setTimeout(() => drawCrosshair(false), 200);
-    }
+     // cx/cy in canvas pixels — normally center, offset while dragging
+     let chX = null, chY = null;
+
+     function drawCrosshair(flash, ox, oy) {
+       const w = crosshairCanvas.width  = crosshairCanvas.offsetWidth;
+       const h = crosshairCanvas.height = crosshairCanvas.offsetHeight;
+       // Default to center
+       const cx = (ox != null) ? ox : w / 2;
+       const cy = (oy != null) ? oy : h / 2;
+       const gap = Math.min(w, h) * 0.045;
+       const arm = Math.min(w, h) * 0.13;
+       const r   = Math.min(w, h) * 0.055;
+       const color = flash ? "rgba(255,80,80,0.95)" : "rgba(0,255,80,0.85)";
+
+       crosshairCtx.clearRect(0, 0, w, h);
+
+       // Face detection box (drawn first, behind crosshair)
+       drawFaceBox(w, h);
+
+       // If dragging, draw a faint line from center to crosshair
+       if (ox != null && oy != null) {
+         crosshairCtx.beginPath();
+         crosshairCtx.moveTo(w / 2, h / 2);
+         crosshairCtx.lineTo(cx, cy);
+         crosshairCtx.strokeStyle = "rgba(0,255,80,0.25)";
+         crosshairCtx.lineWidth = 1;
+         crosshairCtx.shadowBlur = 0;
+         crosshairCtx.stroke();
+       }
+
+       crosshairCtx.strokeStyle = color;
+       crosshairCtx.lineWidth = 2;
+       crosshairCtx.shadowColor = flash ? "#ff2020" : "#00ff50";
+       crosshairCtx.shadowBlur = 6;
+
+       // Center circle
+       crosshairCtx.beginPath();
+       crosshairCtx.arc(cx, cy, r, 0, Math.PI * 2);
+       crosshairCtx.stroke();
+
+       // Four arms
+       [[cx, cy - gap, cx, cy - gap - arm],
+        [cx, cy + gap, cx, cy + gap + arm],
+        [cx - gap, cy, cx - gap - arm, cy],
+        [cx + gap, cy, cx + gap + arm, cy]].forEach(([x1,y1,x2,y2]) => {
+         crosshairCtx.beginPath();
+         crosshairCtx.moveTo(x1, y1);
+         crosshairCtx.lineTo(x2, y2);
+         crosshairCtx.stroke();
+       });
+     }
+
+     drawCrosshair(false);
+     window.addEventListener("resize", () => drawCrosshair(false));
+     videoStream.addEventListener("load", () => drawCrosshair(false));
+
+     function flashCrosshair() {
+       drawCrosshair(true);
+       setTimeout(() => drawCrosshair(false), 200);
+     }
 
     // ---- Drag-to-aim on the video ----
     // Dragging maps the offset from center to servo direction.
@@ -1474,35 +1578,46 @@ app.get("/ui", (_req, res) => {
 
     function setSwitch(state) { faceTrackBtn.dataset.state = state; }
 
-    function onFaceTrackResult(data) {
-      stopFaceTrackPolling();
+     function onFaceTrackResult(data) {
+       stopFaceTrackPolling();
 
-      if (data.error) {
-        setSwitch("safe");
-        return;
-      }
+       if (data.error) {
+         setSwitch("safe");
+         return;
+       }
 
-      if (data.found) {
-        setSwitch("track"); // green lit — TRACK confirmed
-        setTimeout(() => {
-          setSwitch("safe");
-        }, 2000);
-      } else {
-        // Nothing found — show sad face briefly then return to safe
-        setSwitch("notfound");
-        setTimeout(() => setSwitch("safe"), 1500);
-      }
-    }
+       if (data.found) {
+         // 1. Show the detection box immediately
+         showFaceBox(data);
+         setSwitch("track");
+
+         // 2. After 1 second: move servos, then clear the box right away
+         setTimeout(async () => {
+           try {
+             await fetch(apiBase() + "/face-track/move", { cache: "no-store" });
+           } catch (e) {
+             console.error("FaceTrack move error:", e);
+           }
+           clearFaceBox();
+           setSwitch("safe");
+         }, 1000);
+       } else {
+         // Nothing found — show sad face briefly then return to safe
+         setSwitch("notfound");
+         setTimeout(() => setSwitch("safe"), 1500);
+       }
+     }
 
     faceTrackBtn.addEventListener("click", async () => {
       const state = faceTrackBtn.dataset.state;
 
-      // TRACK/SEEKING → SAFE: cancel any ongoing poll, reset visuals
-      if (state === "track" || state === "seeking" || state === "notfound") {
-        stopFaceTrackPolling();
-        setSwitch("safe");
-        return;
-      }
+       // TRACK/SEEKING → SAFE: cancel any ongoing poll, reset visuals
+       if (state === "track" || state === "seeking" || state === "notfound") {
+         stopFaceTrackPolling();
+         clearFaceBox();
+         setSwitch("safe");
+         return;
+       }
 
       // SAFE → SEEK: start a scan
       setSwitch("seeking");

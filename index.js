@@ -1639,11 +1639,8 @@ app.get("/ui", (_req, res) => {
     faceTrackBtn.dataset.state = "safe";
 
     // ---- Face tracking — fire-and-poll ----
-    // Flipping the switch to TRACK fires GET /face-track (returns instantly) then
-    // polls GET /face-track/result every 500 ms.
-    // Flipping back to SAFE while scanning cancels the UI poll (scan still finishes
-    // server-side but result is ignored).
-    // The FIRE button stays enabled at all times.
+    // SEEK keeps re-scanning until a face is found, then fires and stops.
+    // Clicking SEEK again while active cancels the loop.
     let faceTrackPolling = null;
 
     function stopFaceTrackPolling() {
@@ -1655,51 +1652,7 @@ app.get("/ui", (_req, res) => {
 
     function setSwitch(state) { faceTrackBtn.dataset.state = state; }
 
-     function onFaceTrackResult(data) {
-       stopFaceTrackPolling();
-
-       if (data.error) {
-         setSwitch("safe");
-         return;
-       }
-
-        if (data.found) {
-          // 1. Show the detection box immediately
-          showFaceBox(data);
-          setSwitch("track");
-
-          // 2. Move servos immediately (no delay)
-          fetch(apiBase() + "/face-track/move", { cache: "no-store" }).catch(e => {
-            console.error("FaceTrack move error:", e);
-          });
-
-          // 3. After 1 second from face lock: clear box and fire
-          setTimeout(() => {
-            clearFaceBox();
-            setSwitch("safe");
-            fireCannon();
-          }, 500);
-       } else {
-         // Nothing found — show sad face briefly then return to safe
-         setSwitch("notfound");
-         setTimeout(() => setSwitch("safe"), 1500);
-       }
-     }
-
-    faceTrackBtn.addEventListener("click", async () => {
-      const state = faceTrackBtn.dataset.state;
-
-       // TRACK/SEEKING → SAFE: cancel any ongoing poll, reset visuals
-       if (state === "track" || state === "seeking" || state === "notfound") {
-         stopFaceTrackPolling();
-         clearFaceBox();
-         setSwitch("safe");
-         return;
-       }
-
-      // SAFE → SEEK: start a scan
-      setSwitch("seeking");
-
+    async function kickFaceScan() {
       try {
         const kickoff = await fetch(apiBase() + "/face-track", { cache: "no-store" });
         const kickData = await kickoff.json();
@@ -1709,25 +1662,19 @@ app.get("/ui", (_req, res) => {
       } catch (e) {
         console.error("FaceTrack kickoff error:", e);
         setSwitch("safe");
-        return;
+        stopFaceTrackPolling();
       }
+    }
 
-      // Poll /face-track/result every 500 ms; give up after 30 s
-      const pollStart = Date.now();
+    function startFaceTrackPoll() {
+      stopFaceTrackPolling();
       faceTrackPolling = setInterval(async () => {
-        // If user flipped back to SAFE manually, stop polling
+        // If user cancelled manually, stop
         if (faceTrackBtn.dataset.state === "safe") { stopFaceTrackPolling(); return; }
-        // Timeout guard — avoid polling forever if server is stuck
-        if (Date.now() - pollStart > 30000) {
-          console.warn("FaceTrack poll timeout");
-          stopFaceTrackPolling();
-          setSwitch("safe");
-          return;
-        }
         try {
           const r = await fetch(apiBase() + "/face-track/result", { cache: "no-store" });
           const d = await r.json();
-          if (d.status === "pending") return;
+          if (d.status === "pending") return; // still scanning
           onFaceTrackResult(d);
         } catch (e) {
           console.error("FaceTrack poll error:", e);
@@ -1735,6 +1682,57 @@ app.get("/ui", (_req, res) => {
           setSwitch("safe");
         }
       }, 500);
+    }
+
+    function onFaceTrackResult(data) {
+      stopFaceTrackPolling();
+
+      if (data.error) {
+        // On error: if still seeking, retry after a short pause
+        if (faceTrackBtn.dataset.state === "seeking") {
+          setTimeout(() => { kickFaceScan(); startFaceTrackPoll(); }, 800);
+        }
+        return;
+      }
+
+      if (data.found) {
+        // Face found: show box, move servos, fire, then stop seeking
+        showFaceBox(data);
+        setSwitch("track");
+
+        fetch(apiBase() + "/face-track/move", { cache: "no-store" }).catch(e => {
+          console.error("FaceTrack move error:", e);
+        });
+
+        setTimeout(() => {
+          clearFaceBox();
+          setSwitch("safe");
+          fireCannon();
+        }, 500);
+      } else {
+        // Not found: immediately kick off another scan and keep seeking
+        if (faceTrackBtn.dataset.state === "seeking") {
+          kickFaceScan();
+          startFaceTrackPoll();
+        }
+      }
+    }
+
+    faceTrackBtn.addEventListener("click", async () => {
+      const state = faceTrackBtn.dataset.state;
+
+       // TRACK/SEEKING → SAFE: cancel everything
+       if (state === "track" || state === "seeking" || state === "notfound") {
+         stopFaceTrackPolling();
+         clearFaceBox();
+         setSwitch("safe");
+         return;
+       }
+
+      // SAFE → SEEK: start the continuous scan loop
+      setSwitch("seeking");
+      await kickFaceScan();
+      startFaceTrackPoll();
     });
 
     // ---- Motion tracking indicator ----

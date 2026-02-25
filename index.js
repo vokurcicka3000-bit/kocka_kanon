@@ -93,13 +93,11 @@ const SERVO_CENTER = 135;
 const SERVO_H_CHANNEL = 0;
 const SERVO_V_CHANNEL = 1;
 const SERVO_V_SETTLE_MS = 500; // ms to hold position before cutting PWM on vertical servo
-// Camera field of view used for face-tracking servo movement.
-// Tune SERVO_FOV_H/V: increase if undershoots, decrease if overshoots.
-// Tune SERVO_TRACK_GAMMA: < 1 compresses large offsets (helps with fish-eye overshoot at edges),
-//   > 1 expands them. 0.7 is a good starting point for a fish-eye lens.
-const SERVO_FOV_H = 150;       // degrees horizontal
-const SERVO_FOV_V = 112;       // degrees vertical
-const SERVO_TRACK_GAMMA = 0.7; // power-curve correction for fish-eye distortion
+// How many servo degrees correspond to the full image width / height.
+// offsetX = (cx - 0.5) is in range -0.5..+0.5, so dH = offsetX * SERVO_FOV_H.
+// Tune: if the shot lands short of center → increase; if it overshoots → decrease.
+const SERVO_FOV_H = 150;  // degrees per full image width
+const SERVO_FOV_V = 112;  // degrees per full image height
 
 // -------------------- Helpers --------------------
 function clampInt(value, min, max, fallback) {
@@ -833,6 +831,7 @@ async function runFaceTrack() {
   } catch (err) {
     // Catch-all: guarantee faceTrackJob is never left as "running"
     console.error("[FaceTrack] unhandled error:", err);
+    servoTrackingEnabled = false;
     faceTrackJob = { status: "done", result: { error: err.message } };
   }
 }
@@ -854,48 +853,34 @@ async function _runFaceTrackInner() {
   }
 
   if (result.error) {
+    servoTrackingEnabled = false;
     faceTrackJob = { status: "done", result };
     return;
   }
 
   if (!result.found) {
+    servoTrackingEnabled = false;
     faceTrackJob = { status: "done", result: { found: false, label: "none" } };
     return;
   }
 
+  // offsetX/Y: -0.5 (left/top) to +0.5 (right/bottom), 0 = center
   const offsetX = result.cx - 0.5;
   const offsetY = result.cy - 0.5;
-  const DEAD = 0.05;
-  const needsH = Math.abs(offsetX) > DEAD;
-  const needsV = Math.abs(offsetY) > DEAD;
 
-  if (!needsH && !needsV) {
-    faceTrackJob = {
-      status: "done",
-      result: {
-        found: true, label: result.label,
-        cx: result.cx, cy: result.cy,
-        bx: result.bx, by: result.by, bw: result.bw, bh: result.bh,
-        w: result.w, h: result.h,
-        dx: 0, dy: 0, moved: false,
-      },
-      pendingMove: null,
-    };
-    return;
-  }
-
-  // Apply power-curve gamma to compensate for fish-eye lens distortion.
-  // sign(x) * |x|^gamma preserves direction but compresses large offsets when gamma < 1.
-  const applyGamma = (x) => Math.sign(x) * Math.pow(Math.abs(x), SERVO_TRACK_GAMMA);
-  const dH = -applyGamma(offsetX) * SERVO_FOV_H;
-  const dV = -applyGamma(offsetY) * SERVO_FOV_V;
+  // Compute target servo position — do NOT move yet.
+  // Client shows the detection box for 0.5s first, then calls /face-track/move.
+  const dH = -offsetX * SERVO_FOV_H;
+  const dV = -offsetY * SERVO_FOV_V;
 
   const state = readServoState();
-  const newH = needsH ? Math.max(SERVO_MIN, Math.min(SERVO_MAX, Math.round(state.horizontal + dH))) : state.horizontal;
-  const newV = needsV ? Math.max(SERVO_MIN, Math.min(SERVO_MAX, Math.round(state.vertical   + dV))) : state.vertical;
+  const newH = Math.max(SERVO_MIN, Math.min(SERVO_MAX, Math.round(state.horizontal + dH)));
+  const newV = Math.max(SERVO_MIN, Math.min(SERVO_MAX, Math.round(state.vertical   + dV)));
 
-  // Store the intended move but don't execute yet — client will call /face-track/move
-  // after showing the detection box for 1 second.
+  // Immediately lock out the motion tracker so it cannot jitter the servos
+  // while the client is showing the detection box or waiting to fire.
+  servoTrackingEnabled = false;
+
   faceTrackJob = {
     status: "done",
     result: {
@@ -904,9 +889,6 @@ async function _runFaceTrackInner() {
       cx: result.cx, cy: result.cy,
       bx: result.bx, by: result.by, bw: result.bw, bh: result.bh,
       w: result.w, h: result.h,
-      dx: newH - state.horizontal,
-      dy: newV - state.vertical,
-      moved: false,
     },
     pendingMove: { newH, newV },
   };
@@ -931,23 +913,22 @@ app.get("/face-track/result", (req, res) => {
   res.json(faceTrackJob.result);
 });
 
-// Execute the deferred servo move stored by /face-track.
-// Called by the client after showing the detection box for 1 second.
-app.get("/face-track/move", async (req, res) => {
+// Execute the servo move computed by /face-track.
+// Called by the client after showing the detection box for 0.5s.
+app.get("/face-track/move", async (_req, res) => {
   if (!faceTrackJob || !faceTrackJob.pendingMove) {
     res.json({ moved: false });
     return;
   }
   const { newH, newV } = faceTrackJob.pendingMove;
   faceTrackJob.pendingMove = null;
-  const state = readServoState();
   try {
-    const cmds = [];
-    if (newH !== state.horizontal) cmds.push(servoCmd(`SET ${SERVO_H_CHANNEL} ${newH}`));
-    if (newV !== state.vertical)   cmds.push(servoCmd(servoSetCmd(SERVO_V_CHANNEL, newV)));
-    if (cmds.length) await Promise.all(cmds);
+    await Promise.all([
+      servoCmd(`SET ${SERVO_H_CHANNEL} ${newH}`),
+      servoCmd(servoSetCmd(SERVO_V_CHANNEL, newV)),
+    ]);
     writeServoState(newH, newV);
-    res.json({ moved: cmds.length > 0 });
+    res.json({ moved: true });
   } catch (err) {
     console.error("[FaceTrack/move] servo error:", err);
     res.status(500).json({ error: err.message });
@@ -974,6 +955,9 @@ let motionTrackingActive  = false;
 let motionTrackerBuffer   = "";
 // Servo moves from motion tracker are only applied when SEEK is active
 let servoTrackingEnabled  = false;
+// True while a motion-tracker servo move is in-flight (awaiting servoCmd).
+// Prevents a new async invocation from piling up behind the current one.
+let motionTrackerMoveInFlight = false;
 
 function stopMotionTracking() {
   if (motionTrackerProcess) {
@@ -982,6 +966,7 @@ function stopMotionTracking() {
   }
   motionTrackingActive = false;
   motionTrackerBuffer  = "";
+  motionTrackerMoveInFlight = false;
 }
 
 function startMotionTracking() {
@@ -1026,6 +1011,10 @@ function startMotionTracking() {
       // Only move servos when SEEK is active
       if (!servoTrackingEnabled) continue;
 
+      // Skip this frame if a previous move is still awaiting — avoids
+      // piling up async invocations that could fire after SEEK ends.
+      if (motionTrackerMoveInFlight) continue;
+
       // ---- Apply P-controller ----
       const offsetX = msg.cx - 0.5;
       const offsetY = msg.cy - 0.5;
@@ -1043,11 +1032,20 @@ function startMotionTracking() {
       if (newH !== state.horizontal) cmds.push(servoCmd(`SET ${SERVO_H_CHANNEL} ${newH}`));
       if (newV !== state.vertical)   cmds.push(servoCmd(servoSetCmd(SERVO_V_CHANNEL, newV)));
       if (cmds.length) {
+        // Re-check the flag synchronously right before going async.
+        // servoTrackingEnabled could have been cleared between the check
+        // above and here (same tick), but this is the safest we can be
+        // without making the handler synchronous.
+        if (!servoTrackingEnabled) continue;
+        motionTrackerMoveInFlight = true;
         try {
           await Promise.all(cmds);
-          writeServoState(newH, newV);
+          // Only persist if SEEK is still active — discard stale moves.
+          if (servoTrackingEnabled) writeServoState(newH, newV);
         } catch (e) {
           console.error("[MotionTracker] servo error:", e.message);
+        } finally {
+          motionTrackerMoveInFlight = false;
         }
       }
 
@@ -1713,12 +1711,6 @@ app.get("/ui", (_req, res) => {
 
     function setSwitch(state) {
       faceTrackBtn.dataset.state = state;
-      // Keep servo tracking in sync with SEEK state
-      if (state === "seeking") {
-        fetch(apiBase() + "/motion-track/servo-enable", { cache: "no-store" }).catch(() => {});
-      } else {
-        fetch(apiBase() + "/motion-track/servo-disable", { cache: "no-store" }).catch(() => {});
-      }
     }
 
     async function kickFaceScan() {
@@ -1753,37 +1745,36 @@ app.get("/ui", (_req, res) => {
       }, 500);
     }
 
-    function onFaceTrackResult(data) {
+    async function onFaceTrackResult(data) {
       stopFaceTrackPolling();
 
       if (data.error) {
-        // On error: if still seeking, retry after a short pause
-        if (faceTrackBtn.dataset.state === "seeking") {
-          setTimeout(() => { kickFaceScan(); startFaceTrackPoll(); }, 800);
-        }
+        setSwitch("safe");
         return;
       }
 
       if (data.found) {
-        // Face found: show box, move servos, fire, then stop seeking
+        // 1. Show detection box for 0.5s so user sees what was found
         showFaceBox(data);
         setSwitch("track");
 
-        fetch(apiBase() + "/face-track/move", { cache: "no-store" }).catch(e => {
+        await new Promise(r => setTimeout(r, 500));
+        if (faceTrackBtn.dataset.state !== "track") return; // cancelled
+
+        // 2. Hide box and move both servos in one shot
+        clearFaceBox();
+        await fetch(apiBase() + "/face-track/move", { cache: "no-store" }).catch(e => {
           console.error("FaceTrack move error:", e);
         });
 
-        setTimeout(() => {
-          clearFaceBox();
-          setSwitch("safe");
-          fireCannon();
-        }, 500);
+        // 3. Wait 1s locked on target, then fire
+        await new Promise(r => setTimeout(r, 1000));
+        if (faceTrackBtn.dataset.state !== "track") return; // cancelled
+        setSwitch("safe");
+        fireCannon();
       } else {
-        // Not found: immediately kick off another scan and keep seeking
-        if (faceTrackBtn.dataset.state === "seeking") {
-          kickFaceScan();
-          startFaceTrackPoll();
-        }
+        // Nothing found — stop, show notfound state on button
+        setSwitch("notfound");
       }
     }
 

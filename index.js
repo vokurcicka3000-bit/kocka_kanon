@@ -1785,7 +1785,7 @@ app.get("/ui", (_req, res) => {
         return;
       }
 
-      // Face found — refine aim with up to 3 scan+move passes (0.2s settle between each).
+      // Face found — refine aim with up to 3 scan+move passes.
       // The servo converges toward centre with each pass; by the third the crosshair
       // is typically spot-on.
       const PASSES = 3;
@@ -1799,10 +1799,6 @@ app.get("/ui", (_req, res) => {
         });
 
         if (pass === PASSES) break; // no need to re-scan after the last move
-
-        // Wait for servos to settle, then kick a fresh scan from the new position
-        await new Promise(r => setTimeout(r, 200));
-        if (faceTrackBtn.dataset.state !== "seeking" && faceTrackBtn.dataset.state !== "track") return; // cancelled
 
         // Kick next scan and wait for its result
         await kickFaceScan();

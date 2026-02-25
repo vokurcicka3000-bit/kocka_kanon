@@ -1785,7 +1785,7 @@ app.get("/ui", (_req, res) => {
     async function kickFaceScan(crop = null) {
       try {
         let url = apiBase() + "/face-track";
-        if (crop) url += `?cx=${crop.cx}&cy=${crop.cy}&scale=${crop.scale}`;
+        if (crop) url += "?cx=" + crop.cx + "&cy=" + crop.cy + "&scale=" + crop.scale;
         const kickoff = await fetch(url, { cache: "no-store" });
         const kickData = await kickoff.json();
         if (kickData.status !== "started" && kickData.status !== "busy") {

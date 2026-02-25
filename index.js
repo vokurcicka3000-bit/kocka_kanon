@@ -1780,8 +1780,11 @@ app.get("/ui", (_req, res) => {
       }
 
       if (!data.found) {
-        // Nothing found — stop, show notfound state on button
-        setSwitch("notfound");
+        // Nothing found — kick another scan and keep seeking
+        if (faceTrackBtn.dataset.state === "seeking") {
+          await kickFaceScan();
+          startFaceTrackPoll();
+        }
         return;
       }
 
@@ -1846,7 +1849,7 @@ app.get("/ui", (_req, res) => {
       const state = faceTrackBtn.dataset.state;
 
        // TRACK/SEEKING → SAFE: cancel everything
-       if (state === "track" || state === "seeking" || state === "notfound") {
+       if (state === "track" || state === "seeking") {
          stopFaceTrackPolling();
          clearFaceBox();
          setSwitch("safe");

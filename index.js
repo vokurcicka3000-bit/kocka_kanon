@@ -972,6 +972,8 @@ const TRACK_MAX_STEP = 10;   // max degrees to move in one cycle
 let motionTrackerProcess  = null;
 let motionTrackingActive  = false;
 let motionTrackerBuffer   = "";
+// Servo moves from motion tracker are only applied when SEEK is active
+let servoTrackingEnabled  = false;
 
 function stopMotionTracking() {
   if (motionTrackerProcess) {
@@ -1020,6 +1022,9 @@ function startMotionTracking() {
       }
 
       if (!msg.active) continue; // quiet frame — nothing to do
+
+      // Only move servos when SEEK is active
+      if (!servoTrackingEnabled) continue;
 
       // ---- Apply P-controller ----
       const offsetX = msg.cx - 0.5;
@@ -1085,6 +1090,18 @@ app.get("/motion-track/start", (_req, res) => {
 app.get("/motion-track/stop", (_req, res) => {
   stopMotionTracking();
   res.json({ stopped: true });
+});
+
+// API: /motion-track/servo-enable  — called when SEEK becomes active
+app.get("/motion-track/servo-enable", (_req, res) => {
+  servoTrackingEnabled = true;
+  res.json({ servoTracking: true });
+});
+
+// API: /motion-track/servo-disable  — called when SEEK is cancelled or face found
+app.get("/motion-track/servo-disable", (_req, res) => {
+  servoTrackingEnabled = false;
+  res.json({ servoTracking: false });
 });
 
 // Simple UI
@@ -1694,7 +1711,15 @@ app.get("/ui", (_req, res) => {
       }
     }
 
-    function setSwitch(state) { faceTrackBtn.dataset.state = state; }
+    function setSwitch(state) {
+      faceTrackBtn.dataset.state = state;
+      // Keep servo tracking in sync with SEEK state
+      if (state === "seeking") {
+        fetch(apiBase() + "/motion-track/servo-enable", { cache: "no-store" }).catch(() => {});
+      } else {
+        fetch(apiBase() + "/motion-track/servo-disable", { cache: "no-store" }).catch(() => {});
+      }
+    }
 
     async function kickFaceScan() {
       try {

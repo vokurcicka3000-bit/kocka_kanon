@@ -1832,14 +1832,20 @@ app.get("/ui", (_req, res) => {
         return;
       }
 
-      // Face found — refine aim with up to 3 scan+move passes.
-      // Pass 1: full frame. Pass 2: ¼ area (scale 0.5). Pass 3: ⅕ area (scale 0.447).
-      // The crop centres on the last known face position so the detector works on a
-      // progressively tighter window, giving a more accurate centroid each time.
-      const CROP_SCALES = [null, 0.5, 0.447]; // index = pass-1; null = no crop
-      let lastData = data; // track the most recent detection result for the final box
+      // Face found — refine aim with up to 2 scan+move passes.
+      // Pass 1: full frame move. Pass 2: ¼ area (scale 0.5) move.
+      // Before each move: show the detection result for 0.5s, then clear the box, then move.
+      setSwitch("track");
+      const CROP_SCALES = [null, 0.5]; // index = pass-1; null = no crop
+      let lastData = data;
       for (let pass = 1; pass <= CROP_SCALES.length; pass++) {
-        if (faceTrackBtn.dataset.state !== "seeking" && faceTrackBtn.dataset.state !== "track") return; // cancelled
+        if (faceTrackBtn.dataset.state !== "track") return; // cancelled
+
+        // Show detection box for this pass, wait 0.5s, clear before moving
+        showFaceBox(lastData);
+        await new Promise(r => setTimeout(r, 500));
+        if (faceTrackBtn.dataset.state !== "track") return; // cancelled
+        clearFaceBox();
 
         // Move servos to the position computed by this scan
         await fetch(apiBase() + "/face-track/move", { cache: "no-store" }).catch(e => {
@@ -1849,12 +1855,12 @@ app.get("/ui", (_req, res) => {
         if (pass === CROP_SCALES.length) break; // no need to re-scan after the last move
 
         // Kick next scan with a tighter crop centred on the face we just found
-        const scale = CROP_SCALES[pass]; // pass is 1-indexed, so CROP_SCALES[pass] = next pass scale
+        const scale = CROP_SCALES[pass];
         const crop = scale ? { cx: lastData.cx, cy: lastData.cy, scale } : null;
         await kickFaceScan(crop);
         const nextData = await new Promise((resolve) => {
           const poll = setInterval(async () => {
-            if (faceTrackBtn.dataset.state !== "seeking" && faceTrackBtn.dataset.state !== "track") {
+            if (faceTrackBtn.dataset.state !== "track") {
               clearInterval(poll);
               resolve(null); // cancelled
               return;
@@ -1872,22 +1878,16 @@ app.get("/ui", (_req, res) => {
         });
 
         if (!nextData) return; // cancelled
-        if (nextData.error || !nextData.found) {
-          // Lost the face on a refinement pass — use whatever position we already moved to
-          break;
-        }
+        if (nextData.error || !nextData.found) break; // lost face — fire from current position
 
-        lastData = nextData; // server has a new pendingMove ready for next iteration
+        lastData = nextData;
       }
 
-      if (faceTrackBtn.dataset.state !== "seeking" && faceTrackBtn.dataset.state !== "track") return; // cancelled
-
-      // All passes done — show detection box, lock on, fire
-      setSwitch("track");
-      showFaceBox(lastData);
-      await new Promise(r => setTimeout(r, 1000));
       if (faceTrackBtn.dataset.state !== "track") return; // cancelled
-      clearFaceBox();
+
+      // After both passes: wait 0.5s, then fire
+      await new Promise(r => setTimeout(r, 500));
+      if (faceTrackBtn.dataset.state !== "track") return; // cancelled
       setSwitch("safe");
       fireCannon();
     }

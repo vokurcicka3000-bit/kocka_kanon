@@ -1,5 +1,10 @@
 # Agent Guidelines for pi_server
 
+## Git Policy
+
+**Never commit or push changes unless the user explicitly asks.**
+Do not run `git commit`, `git push`, or any destructive git command without a direct instruction from the user to do so.
+
 This is a Node.js/Express server with Python GPIO scripts for Raspberry Pi.
 
 ## Build & Development Commands

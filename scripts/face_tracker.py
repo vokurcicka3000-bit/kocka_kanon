@@ -36,8 +36,18 @@ DETECT_W         = 640  # downscale to this width before detection (faster on Pi
 DETECT_H         = 480
 
 args = sys.argv[1:]
-if args:
-  STREAM_URL = args[0]
+crop_cx    = None   # normalised centre-x of crop window (0-1)
+crop_cy    = None   # normalised centre-y of crop window (0-1)
+crop_scale = 1.0    # linear scale of crop window relative to full frame
+
+while args:
+  a = args.pop(0)
+  if a == "--crop" and len(args) >= 3:
+    crop_cx    = float(args.pop(0))
+    crop_cy    = float(args.pop(0))
+    crop_scale = float(args.pop(0))
+  else:
+    STREAM_URL = a
 
 
 def grab_frame(url, timeout=STREAM_TIMEOUT):
@@ -114,13 +124,42 @@ def main():
 
     fh, fw = bgr.shape[:2]
 
+    # Optional crop: restrict detection to a sub-window centred on the last known face.
+    # crop_scale is a linear fraction of the full frame (e.g. 0.5 → quarter area).
+    # All output coords are remapped back to full-frame normalised space afterwards.
+    off_x, off_y = 0, 0  # pixel offset of crop within full frame
+    crop_fw, crop_fh = fw, fh
+    if crop_cx is not None and crop_scale < 1.0:
+      half_w = int(fw * crop_scale / 2)
+      half_h = int(fh * crop_scale / 2)
+      cx_px  = int(crop_cx * fw)
+      cy_px  = int(crop_cy * fh)
+      x1 = max(0, cx_px - half_w)
+      y1 = max(0, cy_px - half_h)
+      x2 = min(fw, cx_px + half_w)
+      y2 = min(fh, cy_px + half_h)
+      bgr  = bgr[y1:y2, x1:x2]
+      off_x, off_y = x1, y1
+      crop_fh, crop_fw = bgr.shape[:2]
+
     # Downscale for faster detection — coords are normalised so no adjustment needed
     small = cv2.resize(bgr, (DETECT_W, DETECT_H), interpolation=cv2.INTER_LINEAR)
+
+    def to_full(cx, cy, bx, by, bw, bh):
+      """Remap normalised crop-space coords back to full-frame normalised coords."""
+      cx = (off_x + cx * crop_fw) / fw
+      cy = (off_y + cy * crop_fh) / fh
+      bx = (off_x + bx * crop_fw) / fw
+      by = (off_y + by * crop_fh) / fh
+      bw = bw * crop_fw / fw
+      bh = bh * crop_fh / fh
+      return cx, cy, bx, by, bw, bh
 
     # Human face via YuNet
     faces = detect_yunet(small)
     if faces:
       cx, cy, bx, by, bw, bh, score = max(faces, key=lambda d: d[6])
+      cx, cy, bx, by, bw, bh = to_full(cx, cy, bx, by, bw, bh)
       print(json.dumps({"found": True,
                         "cx": round(cx, 4), "cy": round(cy, 4),
                         "bx": round(bx, 4), "by": round(by, 4),
@@ -133,6 +172,7 @@ def main():
     cats = detect_cat_haar(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))
     if cats:
       cx, cy, bx, by, bw, bh, score = max(cats, key=lambda d: d[6])
+      cx, cy, bx, by, bw, bh = to_full(cx, cy, bx, by, bw, bh)
       print(json.dumps({"found": True,
                         "cx": round(cx, 4), "cy": round(cy, 4),
                         "bx": round(bx, 4), "by": round(by, 4),

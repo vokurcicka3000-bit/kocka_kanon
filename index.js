@@ -835,9 +835,9 @@ app.get("/camera/bandwidth-test", (req, res) => {
 
 let faceTrackJob = null; // null | { status: "running" | "done", result: <obj> }
 
-async function runFaceTrack() {
+async function runFaceTrack(crop = null) {
   try {
-    await _runFaceTrackInner();
+    await _runFaceTrackInner(crop);
   } catch (err) {
     // Catch-all: guarantee faceTrackJob is never left as "running"
     console.error("[FaceTrack] unhandled error:", err);
@@ -846,12 +846,14 @@ async function runFaceTrack() {
   }
 }
 
-async function _runFaceTrackInner() {
+async function _runFaceTrackInner(crop = null) {
   // face_tracker.py now grabs a frame from the live MJPEG stream — no camera
   // stop/restart needed; the stream keeps running throughout.
+  const pyArgs = [];
+  if (crop) pyArgs.push("--crop", String(crop.cx), String(crop.cy), String(crop.scale));
   let result;
   try {
-    const py = await runPython(FACE_TRACKER_SCRIPT, []);
+    const py = await runPython(FACE_TRACKER_SCRIPT, pyArgs);
     if (!py.stdout) {
       result = { error: "face_tracker.py produced no output", stderr: py.stderr };
     } else {
@@ -909,8 +911,17 @@ app.get("/face-track", (req, res) => {
     res.json({ status: "busy" });
     return;
   }
+  // Optional crop hint: ?cx=0.5&cy=0.5&scale=0.5
+  let crop = null;
+  if (req.query.cx !== undefined && req.query.cy !== undefined && req.query.scale !== undefined) {
+    crop = {
+      cx:    Math.max(0, Math.min(1, parseFloat(req.query.cx)    || 0.5)),
+      cy:    Math.max(0, Math.min(1, parseFloat(req.query.cy)    || 0.5)),
+      scale: Math.max(0.1, Math.min(1, parseFloat(req.query.scale) || 1.0)),
+    };
+  }
   faceTrackJob = { status: "running", result: null };
-  runFaceTrack(); // fire and forget — do NOT await
+  runFaceTrack(crop); // fire and forget — do NOT await
   res.json({ status: "started" });
 });
 
@@ -1204,10 +1215,13 @@ app.get("/ui", (_req, res) => {
         </div>
       </div>
 
-      <!-- Actions bar: motion alert -->
+      <!-- Actions bar: motion alert + camera toggle -->
       <div class="actions-bar">
         <div class="alert-group">
           <button class="alert-btn" id="alertBtn">🔔 MOTION ALERT</button>
+        </div>
+        <div class="alert-group">
+          <button class="camera-btn" id="cameraToggleBtn">📷 CAMERA</button>
         </div>
       </div>
 
@@ -1287,6 +1301,35 @@ app.get("/ui", (_req, res) => {
       .catch(() => {});
 
     alertBtn.addEventListener("click", toggleAlert);
+
+    // ---- Camera toggle ----
+    const cameraToggleBtn = document.getElementById("cameraToggleBtn");
+    let cameraOn = true; // default on — auto-started on page load
+
+    function setCameraState(on) {
+      cameraOn = on;
+      cameraToggleBtn.classList.toggle("cam-off", !on);
+      cameraToggleBtn.textContent = on ? "📷 CAMERA" : "📷 CAMERA OFF";
+    }
+
+    cameraToggleBtn.addEventListener("click", async () => {
+      cameraToggleBtn.disabled = true;
+      try {
+        if (cameraOn) {
+          await fetch(apiBase() + "/camera?action=stop", { cache: "no-store" });
+          videoStream.src = "";
+          setCameraState(false);
+        } else {
+          // Re-connect the stream — server auto-starts the camera on first UI connection
+          videoStream.src = apiBase() + "/camera/stream?src=ui&quality=" + detectedQuality + "&t=" + Date.now();
+          setCameraState(true);
+        }
+      } catch (e) {
+        console.error("Camera toggle error:", e);
+      } finally {
+        cameraToggleBtn.disabled = false;
+      }
+    });
 
     async function testConnectionQuality() {
       try {
@@ -1739,9 +1782,11 @@ app.get("/ui", (_req, res) => {
       faceTrackBtn.dataset.state = state;
     }
 
-    async function kickFaceScan() {
+    async function kickFaceScan(crop = null) {
       try {
-        const kickoff = await fetch(apiBase() + "/face-track", { cache: "no-store" });
+        let url = apiBase() + "/face-track";
+        if (crop) url += `?cx=${crop.cx}&cy=${crop.cy}&scale=${crop.scale}`;
+        const kickoff = await fetch(url, { cache: "no-store" });
         const kickData = await kickoff.json();
         if (kickData.status !== "started" && kickData.status !== "busy") {
           throw new Error("Unexpected kickoff response: " + JSON.stringify(kickData));
@@ -1789,11 +1834,12 @@ app.get("/ui", (_req, res) => {
       }
 
       // Face found — refine aim with up to 3 scan+move passes.
-      // The servo converges toward centre with each pass; by the third the crosshair
-      // is typically spot-on.
-      const PASSES = 3;
+      // Pass 1: full frame. Pass 2: ¼ area (scale 0.5). Pass 3: ⅕ area (scale 0.447).
+      // The crop centres on the last known face position so the detector works on a
+      // progressively tighter window, giving a more accurate centroid each time.
+      const CROP_SCALES = [null, 0.5, 0.447]; // index = pass-1; null = no crop
       let lastData = data; // track the most recent detection result for the final box
-      for (let pass = 1; pass <= PASSES; pass++) {
+      for (let pass = 1; pass <= CROP_SCALES.length; pass++) {
         if (faceTrackBtn.dataset.state !== "seeking" && faceTrackBtn.dataset.state !== "track") return; // cancelled
 
         // Move servos to the position computed by this scan
@@ -1801,10 +1847,12 @@ app.get("/ui", (_req, res) => {
           console.error("FaceTrack move error:", e);
         });
 
-        if (pass === PASSES) break; // no need to re-scan after the last move
+        if (pass === CROP_SCALES.length) break; // no need to re-scan after the last move
 
-        // Kick next scan and wait for its result
-        await kickFaceScan();
+        // Kick next scan with a tighter crop centred on the face we just found
+        const scale = CROP_SCALES[pass]; // pass is 1-indexed, so CROP_SCALES[pass] = next pass scale
+        const crop = scale ? { cx: lastData.cx, cy: lastData.cy, scale } : null;
+        await kickFaceScan(crop);
         const nextData = await new Promise((resolve) => {
           const poll = setInterval(async () => {
             if (faceTrackBtn.dataset.state !== "seeking" && faceTrackBtn.dataset.state !== "track") {

@@ -263,6 +263,16 @@ app.get("/", (_req, res) => {
   res.type("text").send("Hello from Express on Raspberry Pi!\nTry /ui\n");
 });
 
+// API: /cicka/status — returns { on: bool } based on persisted relay state file
+app.get("/cicka/status", (_req, res) => {
+  let on = false;
+  try {
+    const raw = fs.readFileSync(RELAY_STATE_FILE, { encoding: "utf8" }).trim();
+    on = raw.toUpperCase() === "ON";
+  } catch (_) {}
+  res.json({ on });
+});
+
 // API: /cicka?mode=on|off|pulse&ms=500
 app.get("/cicka", async (req, res) => {
   const mode = pickMode(req.query.mode);
@@ -1395,13 +1405,18 @@ app.get("/ui", (_req, res) => {
     const waterOnBtn  = document.getElementById("waterOnBtn");
     const waterOffBtn = document.getElementById("waterOffBtn");
 
+    function setWateringState(on) {
+      wateringOn = on;
+      waterOnBtn.classList.toggle("running", on);
+      waterOnBtn.disabled  = on;
+      waterOffBtn.disabled = !on;
+    }
+
     async function startWatering() {
       waterOnBtn.disabled = true;
       try {
         await fetch(apiBase() + "/cicka?mode=on", { cache: "no-store" });
-        wateringOn = true;
-        waterOnBtn.classList.add("running");
-        waterOffBtn.disabled = false;
+        setWateringState(true);
       } catch (e) {
         console.error("Watering start error:", e);
         waterOnBtn.disabled = false;
@@ -1412,14 +1427,18 @@ app.get("/ui", (_req, res) => {
       waterOffBtn.disabled = true;
       try {
         await fetch(apiBase() + "/cicka?mode=off", { cache: "no-store" });
-        wateringOn = false;
-        waterOnBtn.classList.remove("running");
-        waterOnBtn.disabled = false;
+        setWateringState(false);
       } catch (e) {
         console.error("Watering stop error:", e);
         waterOffBtn.disabled = false;
       }
     }
+
+    // Restore watering state from server on page load
+    fetch(apiBase() + "/cicka/status", { cache: "no-store" })
+      .then(r => r.json())
+      .then(d => { if (d.on) setWateringState(true); })
+      .catch(() => {});
 
     waterOnBtn.addEventListener("click", startWatering);
     waterOffBtn.addEventListener("click", stopWatering);

@@ -1779,29 +1779,71 @@ app.get("/ui", (_req, res) => {
         return;
       }
 
-      if (data.found) {
-        // 1. Show detection box for 0.5s so user sees what was found
-        showFaceBox(data);
-        setSwitch("track");
+      if (!data.found) {
+        // Nothing found — stop, show notfound state on button
+        setSwitch("notfound");
+        return;
+      }
 
-        await new Promise(r => setTimeout(r, 500));
-        if (faceTrackBtn.dataset.state !== "track") return; // cancelled
+      // Face found — refine aim with up to 3 scan+move passes (0.2s settle between each).
+      // The servo converges toward centre with each pass; by the third the crosshair
+      // is typically spot-on.
+      const PASSES = 3;
+      let lastData = data; // track the most recent detection result for the final box
+      for (let pass = 1; pass <= PASSES; pass++) {
+        if (faceTrackBtn.dataset.state !== "seeking" && faceTrackBtn.dataset.state !== "track") return; // cancelled
 
-        // 2. Hide box and move both servos in one shot
-        clearFaceBox();
+        // Move servos to the position computed by this scan
         await fetch(apiBase() + "/face-track/move", { cache: "no-store" }).catch(e => {
           console.error("FaceTrack move error:", e);
         });
 
-        // 3. Wait 1s locked on target, then fire
-        await new Promise(r => setTimeout(r, 1000));
-        if (faceTrackBtn.dataset.state !== "track") return; // cancelled
-        setSwitch("safe");
-        fireCannon();
-      } else {
-        // Nothing found — stop, show notfound state on button
-        setSwitch("notfound");
+        if (pass === PASSES) break; // no need to re-scan after the last move
+
+        // Wait for servos to settle, then kick a fresh scan from the new position
+        await new Promise(r => setTimeout(r, 200));
+        if (faceTrackBtn.dataset.state !== "seeking" && faceTrackBtn.dataset.state !== "track") return; // cancelled
+
+        // Kick next scan and wait for its result
+        await kickFaceScan();
+        const nextData = await new Promise((resolve) => {
+          const poll = setInterval(async () => {
+            if (faceTrackBtn.dataset.state !== "seeking" && faceTrackBtn.dataset.state !== "track") {
+              clearInterval(poll);
+              resolve(null); // cancelled
+              return;
+            }
+            try {
+              const r = await fetch(apiBase() + "/face-track/result", { cache: "no-store" });
+              const d = await r.json();
+              if (d.status !== "pending") { clearInterval(poll); resolve(d); }
+            } catch (e) {
+              console.error("FaceTrack poll error:", e);
+              clearInterval(poll);
+              resolve({ error: e.message });
+            }
+          }, 500);
+        });
+
+        if (!nextData) return; // cancelled
+        if (nextData.error || !nextData.found) {
+          // Lost the face on a refinement pass — use whatever position we already moved to
+          break;
+        }
+
+        lastData = nextData; // server has a new pendingMove ready for next iteration
       }
+
+      if (faceTrackBtn.dataset.state !== "seeking" && faceTrackBtn.dataset.state !== "track") return; // cancelled
+
+      // All passes done — show detection box, lock on, fire
+      setSwitch("track");
+      showFaceBox(lastData);
+      await new Promise(r => setTimeout(r, 1000));
+      if (faceTrackBtn.dataset.state !== "track") return; // cancelled
+      clearFaceBox();
+      setSwitch("safe");
+      fireCannon();
     }
 
     faceTrackBtn.addEventListener("click", async () => {

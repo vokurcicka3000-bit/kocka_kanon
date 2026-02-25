@@ -1365,9 +1365,8 @@ app.get("/ui", (_req, res) => {
     }
 
     videoStream.onerror = () => {
-      const cameraArea = document.getElementById("cameraArea");
-      if (!cameraArea.classList.contains("hidden")) {
-        setTimeout(() => { videoStream.src = apiBase() + "/camera/stream?src=ui&t=" + Date.now(); }, 1000);
+      if (cameraOn) {
+        setTimeout(() => { videoStream.src = apiBase() + "/camera/stream?src=ui&quality=" + detectedQuality + "&t=" + Date.now(); }, 1000);
       }
     };
 

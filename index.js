@@ -471,7 +471,7 @@ app.get("/motion-alert", async (req, res) => {
   const action = String(req.query.action || "status").toLowerCase();
 
   if (action === "status") {
-    res.type("text").send(`Motion alert: ${motionAlertReady ? "running" : "stopped"}\n`);
+    res.json({ running: motionAlertReady });
     return;
   }
 
@@ -1240,6 +1240,12 @@ app.get("/ui", (_req, res) => {
     tgToken.addEventListener("input",  () => localStorage.setItem("tgToken",  tgToken.value));
     tgChatId.addEventListener("input", () => localStorage.setItem("tgChatId", tgChatId.value));
 
+    function setAlertState(on) {
+      alerting = on;
+      alertBtn.classList.toggle("alerting", alerting);
+      alertBtn.textContent = alerting ? "🔔 ALERTING..." : "🔔 MOTION ALERT";
+    }
+
     async function toggleAlert() {
       const action = alerting ? "stop" : "start";
       alertBtn.disabled = true;
@@ -1255,19 +1261,20 @@ app.get("/ui", (_req, res) => {
           }
           url += "&token=" + encodeURIComponent(token) + "&chat_id=" + encodeURIComponent(chatId);
         }
-        const res  = await fetch(url, { cache: "no-store" });
-        const text = await res.text();
-        if (res.ok) {
-          alerting = !alerting;
-          alertBtn.classList.toggle("alerting", alerting);
-          alertBtn.textContent = alerting ? "🔔 ALERTING..." : "🔔 MOTION ALERT";
-        }
+        const res = await fetch(url, { cache: "no-store" });
+        if (res.ok) setAlertState(!alerting);
       } catch (e) {
         console.error("Alert error:", e);
       } finally {
         alertBtn.disabled = false;
       }
     }
+
+    // Restore motion alert state from server on page load
+    fetch(apiBase() + "/motion-alert?action=status", { cache: "no-store" })
+      .then(r => r.json())
+      .then(d => { if (d.running) setAlertState(true); })
+      .catch(() => {});
 
     alertBtn.addEventListener("click", toggleAlert);
 

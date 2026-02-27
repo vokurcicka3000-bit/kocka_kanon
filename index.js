@@ -462,9 +462,10 @@ app.get("/servo/dance", async (_req, res) => {
 });
 
 // -------------------- Motion Alert --------------------
-let motionAlertProcess = null;
-let motionAlertReady   = false;
-let motionAlertBuffer  = "";
+let motionAlertProcess   = null;
+let motionAlertReady     = false;
+let motionAlertBuffer    = "";
+let motionAlertTriggered = false; // set to true each time MOTION fires; client polls and resets
 
 function stopMotionAlert() {
   if (motionAlertProcess) {
@@ -472,6 +473,7 @@ function stopMotionAlert() {
     motionAlertProcess = null;
     motionAlertReady   = false;
     motionAlertBuffer  = "";
+    motionAlertTriggered = false;
   }
 }
 
@@ -531,7 +533,8 @@ app.get("/motion-alert", async (req, res) => {
           motionAlertReady = true;
           console.log("[MotionAlert] ready");
         } else if (line === "MOTION") {
-          // Don't move servos while alerting — let the camera stay still for clean GIF capture
+          motionAlertTriggered = true;
+          console.log("[MotionAlert] motion detected — seek triggered");
         } else if (line === "QUIET") {
           // nothing to do — tracker is not started when alerting
         } else if (line === "ENCODING") {
@@ -566,6 +569,13 @@ app.get("/motion-alert", async (req, res) => {
   }
 
   res.status(400).type("text").send("Invalid action. Use: start, stop, status\n");
+});
+
+// Returns { triggered: true } once and resets the flag — client polls this while alerting is on
+app.get("/motion-alert/triggered", (_req, res) => {
+  const triggered = motionAlertTriggered;
+  motionAlertTriggered = false;
+  res.json({ triggered });
 });
 
 let cameraProcess = null;
@@ -835,6 +845,112 @@ app.get("/camera/bandwidth-test", (req, res) => {
 
 let faceTrackJob = null; // null | { status: "running" | "done", result: <obj> }
 
+// ---- Persistent face-tracker daemon ----
+// face_tracker.py is kept alive as a long-running process so that Python
+// startup time and model loading (~500-900 ms on a Pi) are paid only once.
+// Communication: one JSON line written to stdin per scan request,
+//                one JSON line read from stdout per response.
+
+let faceTrackerProc  = null;  // the child_process
+let faceTrackerReady = false; // true once the {"ready":true} line has been received
+let _ftResolve       = null;  // resolve() for the currently in-flight scan promise
+
+function _startFaceTrackerDaemon() {
+  if (faceTrackerProc) return; // already running
+  console.log("[FaceTracker] starting daemon…");
+  faceTrackerProc  = spawn("python3", ["-u", FACE_TRACKER_SCRIPT], {
+    env: { ...process.env, PYTHONUNBUFFERED: "1" },
+  });
+  faceTrackerReady = false;
+
+  let buf = "";
+  faceTrackerProc.stdout.on("data", (d) => {
+    buf += d.toString();
+    const lines = buf.split("\n");
+    buf = lines.pop(); // keep incomplete last line
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+      let msg;
+      try { msg = JSON.parse(line); } catch (_) { continue; }
+
+      if (msg.ready) {
+        faceTrackerReady = true;
+        console.log("[FaceTracker] daemon ready");
+        continue;
+      }
+
+      // This is the response to the current scan request.
+      if (_ftResolve) {
+        const resolve = _ftResolve;
+        _ftResolve = null;
+        resolve(msg);
+      }
+    }
+  });
+
+  faceTrackerProc.stderr.on("data", (d) =>
+    console.error("[FaceTracker stderr]", d.toString().trim())
+  );
+
+  faceTrackerProc.on("close", (code) => {
+    console.warn(`[FaceTracker] daemon exited (code ${code}) — will restart on next scan`);
+    faceTrackerProc  = null;
+    faceTrackerReady = false;
+    // If a scan was in-flight, reject it.
+    if (_ftResolve) {
+      const resolve = _ftResolve;
+      _ftResolve = null;
+      resolve({ error: `face_tracker daemon exited with code ${code}` });
+    }
+  });
+
+  faceTrackerProc.on("error", (err) => {
+    console.error("[FaceTracker] spawn error:", err);
+    faceTrackerProc  = null;
+    faceTrackerReady = false;
+    if (_ftResolve) {
+      const resolve = _ftResolve;
+      _ftResolve = null;
+      resolve({ error: err.message });
+    }
+  });
+}
+
+// Send one scan request to the daemon; returns the parsed result object.
+function _faceTrackerScan(crop) {
+  return new Promise((resolve) => {
+    // Restart the daemon if it died
+    if (!faceTrackerProc) _startFaceTrackerDaemon();
+
+    const req = { stream_url: "http://localhost:3000/camera/stream?src=tracker" };
+    if (crop) {
+      req.crop_cx    = crop.cx;
+      req.crop_cy    = crop.cy;
+      req.crop_scale = crop.scale;
+    }
+
+    const send = () => {
+      _ftResolve = resolve;
+      faceTrackerProc.stdin.write(JSON.stringify(req) + "\n");
+    };
+
+    if (faceTrackerReady) {
+      send();
+    } else {
+      // Wait up to 10 s for the daemon to finish loading models
+      const deadline = Date.now() + 10000;
+      const wait = setInterval(() => {
+        if (faceTrackerReady) { clearInterval(wait); send(); return; }
+        if (Date.now() > deadline) {
+          clearInterval(wait);
+          resolve({ error: "face_tracker daemon did not become ready in time" });
+        }
+      }, 50);
+    }
+  });
+}
+
 async function runFaceTrack(crop = null) {
   try {
     await _runFaceTrackInner(crop);
@@ -847,18 +963,9 @@ async function runFaceTrack(crop = null) {
 }
 
 async function _runFaceTrackInner(crop = null) {
-  // face_tracker.py now grabs a frame from the live MJPEG stream — no camera
-  // stop/restart needed; the stream keeps running throughout.
-  const pyArgs = [];
-  if (crop) pyArgs.push("--crop", String(crop.cx), String(crop.cy), String(crop.scale));
   let result;
   try {
-    const py = await runPython(FACE_TRACKER_SCRIPT, pyArgs);
-    if (!py.stdout) {
-      result = { error: "face_tracker.py produced no output", stderr: py.stderr };
-    } else {
-      result = JSON.parse(py.stdout);
-    }
+    result = await _faceTrackerScan(crop);
   } catch (err) {
     console.error("[FaceTrack] error:", err);
     result = { error: err.message };
@@ -881,7 +988,7 @@ async function _runFaceTrackInner(crop = null) {
   const offsetY = result.cy - 0.5;
 
   // Compute target servo position — do NOT move yet.
-  // Client shows the detection box for 0.5s first, then calls /face-track/move.
+  // Client shows the detection box first, then calls /face-track/move.
   const dH = -offsetX * SERVO_FOV_H;
   const dV = -offsetY * SERVO_FOV_V;
 
@@ -905,6 +1012,9 @@ async function _runFaceTrackInner(crop = null) {
     pendingMove: { newH, newV },
   };
 }
+
+// Pre-warm the daemon when the server starts so the first scan is instant.
+_startFaceTrackerDaemon();
 
 app.get("/face-track", (req, res) => {
   if (faceTrackJob && faceTrackJob.status === "running") {
@@ -1257,6 +1367,7 @@ app.get("/ui", (_req, res) => {
     const tgToken   = document.getElementById("tgToken");
     const tgChatId  = document.getElementById("tgChatId");
     let alerting = false;
+    let motionTriggerPoll = null; // interval that watches for MOTION events while alerting
 
     // Persist token/chat_id in localStorage so the user doesn't retype them
     tgToken.value  = localStorage.getItem("tgToken")  || "";
@@ -1268,6 +1379,40 @@ app.get("/ui", (_req, res) => {
       alerting = on;
       alertBtn.classList.toggle("alerting", alerting);
       alertBtn.textContent = alerting ? "🔔 ALERTING..." : "🔔 MOTION ALERT";
+      if (on) {
+        startMotionTriggerPoll();
+      } else {
+        stopMotionTriggerPoll();
+        // If seek was running because of motion alert, cancel it
+        if (faceTrackBtn.dataset.state === "seeking" || faceTrackBtn.dataset.state === "track") {
+          stopFaceTrackPolling();
+          clearFaceBox();
+          setSwitch("safe");
+        }
+      }
+    }
+
+    function startMotionTriggerPoll() {
+      stopMotionTriggerPoll();
+      motionTriggerPoll = setInterval(async () => {
+        if (!alerting) { stopMotionTriggerPoll(); return; }
+        // Don't start a new seek if one is already running
+        if (faceTrackBtn.dataset.state !== "safe") return;
+        try {
+          const r = await fetch(apiBase() + "/motion-alert/triggered", { cache: "no-store" });
+          const d = await r.json();
+          if (d.triggered) startSeek();
+        } catch (e) {
+          console.error("MotionTrigger poll error:", e);
+        }
+      }, 500);
+    }
+
+    function stopMotionTriggerPoll() {
+      if (motionTriggerPoll !== null) {
+        clearInterval(motionTriggerPoll);
+        motionTriggerPoll = null;
+      }
     }
 
     async function toggleAlert() {
@@ -1785,11 +1930,18 @@ app.get("/ui", (_req, res) => {
       try {
         let url = apiBase() + "/face-track";
         if (crop) url += "?cx=" + crop.cx + "&cy=" + crop.cy + "&scale=" + crop.scale;
-        const kickoff = await fetch(url, { cache: "no-store" });
-        const kickData = await kickoff.json();
-        if (kickData.status !== "started" && kickData.status !== "busy") {
+        // Retry if busy (previous scan still finishing) — up to 10 × 300ms = 3s
+        for (let attempt = 0; attempt < 10; attempt++) {
+          const kickoff = await fetch(url, { cache: "no-store" });
+          const kickData = await kickoff.json();
+          if (kickData.status === "started") return; // success
+          if (kickData.status === "busy") {
+            await new Promise(r => setTimeout(r, 300));
+            continue;
+          }
           throw new Error("Unexpected kickoff response: " + JSON.stringify(kickData));
         }
+        throw new Error("Face scan still busy after retries");
       } catch (e) {
         console.error("FaceTrack kickoff error:", e);
         setSwitch("safe");
@@ -1812,7 +1964,7 @@ app.get("/ui", (_req, res) => {
           stopFaceTrackPolling();
           setSwitch("safe");
         }
-      }, 500);
+      }, 100);
     }
 
     async function onFaceTrackResult(data) {
@@ -1832,8 +1984,9 @@ app.get("/ui", (_req, res) => {
         return;
       }
 
-      // Face found — refine aim with up to 2 scan+move passes.
+      // Face found — refine aim with exactly 2 scan+move passes before firing.
       // Pass 1: full frame move. Pass 2: ¼ area (scale 0.5) move.
+      // Pass 2 retries its scan until the face is re-acquired; the cannon never fires on fewer than 2 passes.
       // Before each move: show the detection result for 0.5s, then clear the box, then move.
       setSwitch("track");
       const CROP_SCALES = [null, 0.5]; // index = pass-1; null = no crop
@@ -1841,9 +1994,9 @@ app.get("/ui", (_req, res) => {
       for (let pass = 1; pass <= CROP_SCALES.length; pass++) {
         if (faceTrackBtn.dataset.state !== "track") return; // cancelled
 
-        // Show detection box for this pass, wait 0.5s, clear before moving
+        // Show detection box for this pass, wait 0.2s, clear before moving
         showFaceBox(lastData);
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 200));
         if (faceTrackBtn.dataset.state !== "track") return; // cancelled
         clearFaceBox();
 
@@ -1858,7 +2011,7 @@ app.get("/ui", (_req, res) => {
         const scale = CROP_SCALES[pass];
         const crop = scale ? { cx: lastData.cx, cy: lastData.cy, scale } : null;
         await kickFaceScan(crop);
-        const nextData = await new Promise((resolve) => {
+        let nextData = await new Promise((resolve) => {
           const poll = setInterval(async () => {
             if (faceTrackBtn.dataset.state !== "track") {
               clearInterval(poll);
@@ -1874,22 +2027,59 @@ app.get("/ui", (_req, res) => {
               clearInterval(poll);
               resolve({ error: e.message });
             }
-          }, 500);
+          }, 100);
         });
 
         if (!nextData) return; // cancelled
-        if (nextData.error || !nextData.found) break; // lost face — fire from current position
+        if (nextData.error) break; // error — fire from current position
+
+        // If pass 2 didn't find the face, keep retrying the same crop until it does
+        while (!nextData.found) {
+          if (faceTrackBtn.dataset.state !== "track") return; // cancelled
+          await kickFaceScan({ cx: lastData.cx, cy: lastData.cy, scale });
+          nextData = await new Promise((resolve) => {
+            const poll = setInterval(async () => {
+              if (faceTrackBtn.dataset.state !== "track") {
+                clearInterval(poll);
+                resolve(null);
+                return;
+              }
+              try {
+                const r = await fetch(apiBase() + "/face-track/result", { cache: "no-store" });
+                const d = await r.json();
+                if (d.status !== "pending") { clearInterval(poll); resolve(d); }
+              } catch (e) {
+                console.error("FaceTrack poll error:", e);
+                clearInterval(poll);
+                resolve({ error: e.message });
+              }
+            }, 100);
+          });
+          if (!nextData) return; // cancelled
+          if (nextData.error) { nextData = { found: false }; break; } // error — exit retry loop
+        }
+
+        if (!nextData.found) break; // couldn't re-acquire — fire from current position
 
         lastData = nextData;
       }
 
       if (faceTrackBtn.dataset.state !== "track") return; // cancelled
 
-      // After both passes: wait 0.5s, then fire
-      await new Promise(r => setTimeout(r, 500));
+      // After both passes: wait 0.2s, then fire
+      await new Promise(r => setTimeout(r, 200));
       if (faceTrackBtn.dataset.state !== "track") return; // cancelled
-      setSwitch("safe");
       fireCannon();
+
+      // Always re-arm: keep seeking until the user manually cancels.
+      startSeek();
+    }
+
+    // Start a seek cycle (used by button click and by motion alert trigger)
+    async function startSeek() {
+      setSwitch("seeking");
+      await kickFaceScan();
+      startFaceTrackPoll();
     }
 
     faceTrackBtn.addEventListener("click", async () => {
@@ -1904,9 +2094,7 @@ app.get("/ui", (_req, res) => {
        }
 
       // SAFE → SEEK: start the continuous scan loop
-      setSwitch("seeking");
-      await kickFaceScan();
-      startFaceTrackPoll();
+      await startSeek();
     });
 
     // ---- Motion tracking indicator ----

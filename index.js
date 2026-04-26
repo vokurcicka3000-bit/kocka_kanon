@@ -4,17 +4,9 @@ const { spawn, exec } = require("child_process");
 const fs = require("fs");
 
 // -------------------- State files --------------------
-const RELAY_STATE_FILE = "/tmp/relay_state.txt";
 const CAMERA_PID_FILE = "/tmp/camera.pid";
 const SERVO_STATE_FILE = "/tmp/servo_state.txt";
 
-function writeRelayState(state) {
-  try {
-    fs.writeFileSync(RELAY_STATE_FILE, state + "\n", { encoding: "utf8" });
-  } catch (e) {
-    console.error("Failed to write relay state:", e);
-  }
-}
 
 function readServoState() {
   try {
@@ -75,17 +67,12 @@ function isProcessRunning(pid) {
 
 // -------------------- Config --------------------
 const PORT = 3000;
-const SCRIPT = path.join(__dirname, "scripts", "relecko.py");
 const SERVO_SCRIPT = path.join(__dirname, "scripts", "servo.py");
 const BEEP_SCRIPT    = path.join(__dirname, "scripts", "beep.py");
 const MOTION_ALERT_SCRIPT = path.join(__dirname, "scripts", "motion_alert.py");
 const FACE_TRACKER_SCRIPT    = path.join(__dirname, "scripts", "face_tracker.py");
 const MOTION_TRACKER_SCRIPT  = path.join(__dirname, "scripts", "motion_tracker.py");
 const SERVO_PYTHON = path.join(__dirname, "scripts", "servo-env", "bin", "python");
-const MODES = new Set(["on", "off", "pulse"]);
-const PULSE_MIN_MS = 50;
-const PULSE_MAX_MS = 5000;
-const PULSE_DEFAULT_MS = 500;
 const SERVO_STEP = 5;
 const SERVO_MIN = 0;
 const SERVO_MAX = 270;
@@ -104,11 +91,6 @@ function clampInt(value, min, max, fallback) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(Math.trunc(n), max));
-}
-
-function pickMode(value) {
-  const m = String(value ?? "pulse");
-  return MODES.has(m) ? m : "pulse";
 }
 
 function textResponse({ code, stdout, stderr }) {
@@ -237,7 +219,6 @@ app.use((req, res, next) => {
 app.use(express.static(path.join(__dirname, "public")));
 
 // set initial state
-writeRelayState("OFF");
 writeServoState(SERVO_CENTER, SERVO_CENTER);
 startServoDaemon();
 
@@ -261,42 +242,6 @@ initServos();
 
 app.get("/", (_req, res) => {
   res.type("text").send("Hello from Express on Raspberry Pi!\nTry /ui\n");
-});
-
-// API: /cicka/status — returns { on: bool } based on persisted relay state file
-app.get("/cicka/status", (_req, res) => {
-  let on = false;
-  try {
-    const raw = fs.readFileSync(RELAY_STATE_FILE, { encoding: "utf8" }).trim();
-    on = raw.toUpperCase() === "ON";
-  } catch (_) {}
-  res.json({ on });
-});
-
-// API: /cicka?mode=on|off|pulse&ms=500
-app.get("/cicka", async (req, res) => {
-  const mode = pickMode(req.query.mode);
-  const ms = clampInt(req.query.ms, PULSE_MIN_MS, PULSE_MAX_MS, PULSE_DEFAULT_MS);
-
-  try {
-    const result = await runPython(SCRIPT, [mode, String(ms)]);
-
-    // Update state file based on requested mode.
-    // For pulse, final state is OFF.
-    if (mode === "on") writeRelayState("ON");
-    else writeRelayState("OFF");
-
-    // If python returned non-zero, show output (but state file still updated above).
-    if (result.code !== 0) {
-      res.status(500).type("text").send(textResponse(result));
-      return;
-    }
-
-    res.type("text").send(textResponse(result));
-  } catch (err) {
-    console.error(err);
-    res.status(500).type("text").send(`Node error:\n${err.message}\n`);
-  }
 });
 
 // API: /servo?dir=up|down|left|right|off
@@ -1317,11 +1262,7 @@ app.get("/ui", (_req, res) => {
           </div>
 
           <div class="fire-col">
-            <div class="fire-guard">
-              <button class="fire-btn" id="fireBtn">FIRE</button>
             </div>
-            <span class="fire-label">&#9888; ARMED</span>
-          </div>
         </div>
       </div>
 
@@ -1332,15 +1273,6 @@ app.get("/ui", (_req, res) => {
         </div>
         <div class="alert-group">
           <button class="camera-btn" id="cameraToggleBtn">📷 CAMERA</button>
-        </div>
-      </div>
-
-      <!-- Watering controls -->
-      <div class="watering-bar">
-        <span class="watering-label">&#128167; WATERING</span>
-        <div class="watering-btns">
-          <button class="water-btn water-on-btn" id="waterOnBtn">&#9654; START</button>
-          <button class="water-btn water-off-btn" id="waterOffBtn" disabled>&#9632; STOP</button>
         </div>
       </div>
 
@@ -1558,77 +1490,6 @@ app.get("/ui", (_req, res) => {
     document.getElementById("dCenter").addEventListener("click", () => {
       fetch(apiBase() + "/servo/center", { cache: "no-store" }).catch(console.error);
     });
-
-    // ---- FIRE (relay pulse) ----
-    let fireInFlight = false;
-    async function fireCannon() {
-      if (fireInFlight) return;
-      const btn = document.getElementById("fireBtn");
-      fireInFlight = true;
-      btn.disabled = true;
-      btn.textContent = "...";
-      // Safety net: always re-enable after 2 s even if fetch hangs
-      const safetyTimer = setTimeout(() => {
-        btn.disabled = false;
-        btn.textContent = "FIRE";
-        fireInFlight = false;
-      }, 2000);
-      flashCrosshair();
-      try {
-        await fetch(apiBase() + "/cicka?mode=pulse&ms=1500", { cache: "no-store" });
-      } catch (e) {
-        console.error("Fire error:", e);
-      } finally {
-        clearTimeout(safetyTimer);
-        btn.disabled = false;
-        btn.textContent = "FIRE";
-        fireInFlight = false;
-      }
-    }
-    document.getElementById("fireBtn").addEventListener("click", fireCannon);
-
-    // ---- Watering (continuous on/off) ----
-    let wateringOn = false;
-    const waterOnBtn  = document.getElementById("waterOnBtn");
-    const waterOffBtn = document.getElementById("waterOffBtn");
-
-    function setWateringState(on) {
-      wateringOn = on;
-      waterOnBtn.classList.toggle("running", on);
-      waterOnBtn.disabled  = on;
-      waterOffBtn.disabled = !on;
-    }
-
-    async function startWatering() {
-      waterOnBtn.disabled = true;
-      try {
-        await fetch(apiBase() + "/cicka?mode=on", { cache: "no-store" });
-        setWateringState(true);
-      } catch (e) {
-        console.error("Watering start error:", e);
-        waterOnBtn.disabled = false;
-      }
-    }
-
-    async function stopWatering() {
-      waterOffBtn.disabled = true;
-      try {
-        await fetch(apiBase() + "/cicka?mode=off", { cache: "no-store" });
-        setWateringState(false);
-      } catch (e) {
-        console.error("Watering stop error:", e);
-        waterOffBtn.disabled = false;
-      }
-    }
-
-    // Restore watering state from server on page load
-    fetch(apiBase() + "/cicka/status", { cache: "no-store" })
-      .then(r => r.json())
-      .then(d => { if (d.on) setWateringState(true); })
-      .catch(() => {});
-
-    waterOnBtn.addEventListener("click", startWatering);
-    waterOffBtn.addEventListener("click", stopWatering);
 
      // ---- Crosshair + face-detection overlay ----
      const crosshairCanvas = document.getElementById("crosshairCanvas");

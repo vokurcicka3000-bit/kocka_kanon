@@ -31,8 +31,15 @@ import cv2
 
 SCRIPT_DIR       = os.path.dirname(os.path.abspath(__file__))
 YUNET_MODEL      = os.path.join(SCRIPT_DIR, "face_detection_yunet_2023mar.onnx")
-CASCADE_DIR      = "/usr/share/opencv4/haarcascades"
-CAT_CASCADE_PATH = os.path.join(CASCADE_DIR, "haarcascade_frontalcatface_extended.xml")
+
+# Locate the Haar cascade — try the system path first, then cv2's bundled data dir.
+_CASCADE_NAME    = "haarcascade_frontalcatface_extended.xml"
+_CASCADE_CANDIDATES = [
+  os.path.join("/usr/share/opencv4/haarcascades", _CASCADE_NAME),
+  os.path.join("/usr/share/opencv/haarcascades",  _CASCADE_NAME),
+  os.path.join(getattr(getattr(cv2, "data", None), "haarcascades", ""), _CASCADE_NAME),
+]
+CAT_CASCADE_PATH = next((p for p in _CASCADE_CANDIDATES if os.path.isfile(p)), None)
 
 STREAM_TIMEOUT   = 10   # seconds to wait for a frame
 YUNET_THRESHOLD  = 0.5
@@ -61,7 +68,9 @@ _yunet_crop = cv2.FaceDetectorYN.create(
 )
 _yunet_crop.setInputSize((DETECT_W_CROP, DETECT_H_CROP))
 
-_cat_cascade = cv2.CascadeClassifier(CAT_CASCADE_PATH)
+_cat_cascade = cv2.CascadeClassifier(CAT_CASCADE_PATH) if CAT_CASCADE_PATH else None
+if _cat_cascade is None:
+  print(json.dumps({"warning": "cat cascade not found — cat detection disabled"}), flush=True, file=sys.stderr)
 
 print(json.dumps({"ready": True}), flush=True)
 
@@ -119,6 +128,8 @@ def detect_yunet(bgr, cropped=False):
 
 def detect_cat_haar(gray):
   """Run Haar cat cascade. Returns list of (cx,cy,bx,by,bw,bh,score)."""
+  if _cat_cascade is None:
+    return []
   fh, fw = gray.shape
   eq = cv2.equalizeHist(gray)
   cats = _cat_cascade.detectMultiScale(eq, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))

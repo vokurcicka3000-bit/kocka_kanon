@@ -6,6 +6,7 @@ const fs = require("fs");
 // -------------------- State files --------------------
 const CAMERA_PID_FILE = "/tmp/camera.pid";
 const SERVO_STATE_FILE = "/tmp/servo_state.txt";
+const MOTOR_SCRIPT = path.join(__dirname, "scripts", "motor_daemon.py");
 
 
 function readServoState() {
@@ -73,7 +74,7 @@ const MOTION_ALERT_SCRIPT = path.join(__dirname, "scripts", "motion_alert.py");
 const FACE_TRACKER_SCRIPT    = path.join(__dirname, "scripts", "face_tracker.py");
 const MOTION_TRACKER_SCRIPT  = path.join(__dirname, "scripts", "motion_tracker.py");
 const SERVO_PYTHON = path.join(__dirname, "scripts", "servo-env", "bin", "python");
-const SERVO_STEP = 5;
+const SERVO_STEP = 10;
 const SERVO_MIN = 0;
 const SERVO_MAX = 270;
 const SERVO_CENTER = 135;
@@ -221,24 +222,6 @@ app.use(express.static(path.join(__dirname, "public")));
 // set initial state
 writeServoState(SERVO_CENTER, SERVO_CENTER);
 startServoDaemon();
-
-async function initServos() {
-  // Wait for daemon to be ready
-  await new Promise((resolve) => {
-    const check = () => servoReady ? resolve() : setTimeout(check, 100);
-    check();
-  });
-  try {
-    await Promise.all([
-      servoCmd(`SET ${SERVO_H_CHANNEL} ${SERVO_CENTER}`),
-      servoCmd(servoSetCmd(SERVO_V_CHANNEL, SERVO_CENTER))
-    ]);
-    console.log(`[Servo] initialized to ${SERVO_CENTER}°`);
-  } catch (e) {
-    console.error("Failed to initialize servos:", e);
-  }
-}
-initServos();
 
 app.get("/", (_req, res) => {
   res.type("text").send("Hello from Express on Raspberry Pi!\nTry /ui\n");
@@ -1219,6 +1202,8 @@ app.get("/ui", (_req, res) => {
             <option value="verylow">Very Low</option>
           </select>
         </div>
+        <!-- Fullscreen button — bottom-right corner overlay -->
+        <button class="fullscreen-btn" id="fullscreenBtn" title="Fullscreen">⛶</button>
       </div>
 
       <!-- Camera controls: D-pad + FIRE -->
@@ -1264,6 +1249,33 @@ app.get("/ui", (_req, res) => {
           <div class="fire-col">
             </div>
         </div>
+      </div>
+
+      <!-- Tank drive controls -->
+      <div class="tank-section">
+        <div class="tank-header">
+          <span class="tank-label">TANK DRIVE</span>
+          <span class="gamepad-badge" id="gamepadBadge">NO GAMEPAD</span>
+        </div>
+
+        <!-- Speed slider -->
+        <div class="speed-row">
+          <span class="speed-label">SPEED</span>
+          <input type="range" id="speedSlider" min="10" max="100" value="50" step="5">
+          <span class="speed-value" id="speedValue">50%</span>
+          <span class="speed-hint">LT ◀ ▶ RT</span>
+        </div>
+
+        <!-- Visual tank pad (WASD indicators) -->
+        <div class="tank-pad">
+          <div class="tank-empty"></div>
+          <div class="tank-key" id="tkW">W</div>
+          <div class="tank-empty"></div>
+          <div class="tank-key" id="tkA">A</div>
+          <div class="tank-key" id="tkS">S</div>
+          <div class="tank-key" id="tkD">D</div>
+        </div>
+        <div class="tank-hint">W/S = forward/back &nbsp;|&nbsp; A/D = turn &nbsp;|&nbsp; Left stick = gamepad</div>
       </div>
 
       <!-- Actions bar: motion alert + camera toggle -->
@@ -1465,7 +1477,7 @@ app.get("/ui", (_req, res) => {
 
     // ---- Hold-to-move D-pad ----
     // Fires immediately on press, then repeats every REPEAT_MS while held.
-    const REPEAT_MS = 120;
+    const REPEAT_MS = 60;
     let holdTimer = null;
 
     function startHold(dir) {
@@ -1742,14 +1754,20 @@ app.get("/ui", (_req, res) => {
     // Make the canvas show a grab cursor when hoverable
     crosshairCanvas.style.cursor = "crosshair";
 
-    // ---- Keyboard: hold-to-repeat arrows + spacebar fire ----
+    // ---- Keyboard: hold-to-repeat arrows + WASD tank + spacebar fire ----
     const heldKeys = {};
     document.addEventListener("keydown", (e) => {
-      const map = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right" };
-      if (map[e.key] && !heldKeys[e.key]) {
+      const servoMap = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right" };
+      if (servoMap[e.key] && !heldKeys[e.key]) {
         e.preventDefault();
         heldKeys[e.key] = true;
-        startHold(map[e.key]);
+        startHold(servoMap[e.key]);
+      }
+      const tankKeys = new Set(["w","a","s","d","W","A","S","D"]);
+      if (tankKeys.has(e.key) && !heldKeys[e.key]) {
+        e.preventDefault();
+        heldKeys[e.key] = true;
+        updateTankFromKeys();
       }
       if (e.code === "Space") {
         e.preventDefault();
@@ -1757,13 +1775,268 @@ app.get("/ui", (_req, res) => {
       }
     });
     document.addEventListener("keyup", (e) => {
-      const map = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right" };
-      if (map[e.key]) {
+      const servoMap = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right" };
+      if (servoMap[e.key]) {
         delete heldKeys[e.key];
-        // Only stop hold if no other arrow is still pressed
-        if (!Object.keys(heldKeys).length) stopHold();
+        if (!Object.keys(heldKeys).filter(k => servoMap[k]).length) stopHold();
+      }
+      const tankKeys = new Set(["w","a","s","d","W","A","S","D"]);
+      if (tankKeys.has(e.key)) {
+        delete heldKeys[e.key];
+        updateTankFromKeys();
       }
     });
+
+    // ---- Speed slider ----
+    const speedSlider = document.getElementById("speedSlider");
+    const speedValue  = document.getElementById("speedValue");
+    let motorSpeed = 50; // 0-100
+
+    function setMotorSpeed(v) {
+      motorSpeed = Math.max(10, Math.min(100, Math.round(v)));
+      speedSlider.value = motorSpeed;
+      speedValue.textContent = motorSpeed + "%";
+    }
+
+    speedSlider.addEventListener("input", () => setMotorSpeed(Number(speedSlider.value)));
+
+    // ---- Motor API ----
+    let motorInflight = false;
+    let pendingMotor  = null; // { left, right } to send when current request finishes
+
+    async function sendMotor(left, right) {
+      const payload = { left, right };
+      if (motorInflight) { pendingMotor = payload; return; }
+      motorInflight = true;
+      try {
+        await fetch(apiBase() + "/motor?left=" + left + "&right=" + right, { cache: "no-store" });
+      } catch (e) {
+        console.error("Motor error:", e);
+      } finally {
+        motorInflight = false;
+        if (pendingMotor) {
+          const p = pendingMotor; pendingMotor = null;
+          sendMotor(p.left, p.right);
+        }
+      }
+    }
+
+    async function motorStop() {
+      pendingMotor = null;
+      motorInflight = false; // allow the stop through immediately
+      rampTarget(0, 0);      // ramp will reach 0 and stop the loop
+      try {
+        await fetch(apiBase() + "/motor/stop", { cache: "no-store" });
+      } catch (e) {
+        console.error("Motor stop error:", e);
+      }
+    }
+
+    // ---- Motor ramp-up ----
+    // Target values set by WASD / gamepad. A 20 Hz ticker steps the
+    // actual commanded values toward the target at RAMP_STEP per tick,
+    // giving a soft start without affecting braking (stop snaps to 0).
+    const RAMP_STEP = 8;   // % per tick (50 ms) → ~0 to 100 in ~625 ms
+    let rampLeft    = 0;   // currently commanded left
+    let rampRight   = 0;   // currently commanded right
+    let rampTgtLeft = 0;   // desired left
+    let rampTgtRight= 0;   // desired right
+    let rampTimer   = null;
+
+    function rampStep(cur, tgt) {
+      if (cur === tgt) return tgt;
+      const delta = tgt - cur;
+      return Math.abs(delta) <= RAMP_STEP ? tgt : cur + Math.sign(delta) * RAMP_STEP;
+    }
+
+    function rampTick() {
+      rampLeft  = rampStep(rampLeft,  rampTgtLeft);
+      rampRight = rampStep(rampRight, rampTgtRight);
+      if (rampLeft === 0 && rampRight === 0) {
+        clearInterval(rampTimer);
+        rampTimer = null;
+      } else {
+        sendMotor(rampLeft, rampRight);
+      }
+    }
+
+    function rampTarget(left, right) {
+      rampTgtLeft  = left;
+      rampTgtRight = right;
+      if (left === 0 && right === 0) {
+        // Snap current to 0 immediately so the next start ramps from 0
+        rampLeft  = 0;
+        rampRight = 0;
+        if (rampTimer) { clearInterval(rampTimer); rampTimer = null; }
+        return;
+      }
+      if (!rampTimer) rampTimer = setInterval(rampTick, 50);
+    }
+
+    // ---- Tank key visual indicators ----
+    const tankKeyEls = {
+      w: document.getElementById("tkW"),
+      a: document.getElementById("tkA"),
+      s: document.getElementById("tkS"),
+      d: document.getElementById("tkD"),
+    };
+
+    function setTankKeyActive(key, on) {
+      const el = tankKeyEls[key.toLowerCase()];
+      if (el) el.classList.toggle("active", on);
+    }
+
+    // Compute and send tank drive from currently held WASD keys
+    let lastTankLeft = 0, lastTankRight = 0;
+    function updateTankFromKeys() {
+      const w = !!(heldKeys["w"] || heldKeys["W"]);
+      const s = !!(heldKeys["s"] || heldKeys["S"]);
+      const a = !!(heldKeys["a"] || heldKeys["A"]);
+      const d = !!(heldKeys["d"] || heldKeys["D"]);
+
+      setTankKeyActive("w", w);
+      setTankKeyActive("s", s);
+      setTankKeyActive("a", a);
+      setTankKeyActive("d", d);
+
+      let spd = motorSpeed;
+      let left = 0, right = 0;
+      if (w)  { left =  spd; right =  spd; }
+      if (s)  { left = -spd; right = -spd; }
+      if (a)  { left = -spd * 0.6; right =  spd * 0.6; } // pivot left
+      if (d)  { left =  spd * 0.6; right = -spd * 0.6; } // pivot right
+      // w+a / w+d: curve
+      if (w && a) { left =  spd * 0.4; right =  spd; }
+      if (w && d) { left =  spd;       right =  spd * 0.4; }
+      if (s && a) { left = -spd * 0.4; right = -spd; }
+      if (s && d) { left = -spd;       right = -spd * 0.4; }
+
+      left  = Math.round(left);
+      right = Math.round(right);
+
+      if (left === lastTankLeft && right === lastTankRight) return;
+      lastTankLeft  = left;
+      lastTankRight = right;
+
+      if (left === 0 && right === 0) motorStop();
+      else rampTarget(left, right);
+    }
+
+    // ---- Gamepad support ----
+    const gamepadBadge = document.getElementById("gamepadBadge");
+    let gamepadIndex = null;
+    let gamepadLoop  = null;
+
+    // Deadzone for analog sticks
+    const STICK_DEAD  = 0.12;
+    // Deadzone for triggers (LT/RT)
+    const TRIG_DEAD   = 0.05;
+    // How fast LT/RT change speed (% per frame at full press)
+    const TRIG_SPEED_RATE = 0.8; // %/frame
+
+    function applyDeadzone(v, dz) {
+      if (Math.abs(v) < dz) return 0;
+      return (v - Math.sign(v) * dz) / (1 - dz);
+    }
+
+    function setGamepadBadge(connected, name) {
+      gamepadBadge.textContent  = connected ? ("🎮 " + (name || "GAMEPAD")) : "NO GAMEPAD";
+      gamepadBadge.classList.toggle("gp-connected", connected);
+    }
+
+    window.addEventListener("gamepadconnected", (e) => {
+      gamepadIndex = e.gamepad.index;
+      setGamepadBadge(true, e.gamepad.id.slice(0, 20));
+      startGamepadLoop();
+    });
+
+    window.addEventListener("gamepaddisconnected", (e) => {
+      if (e.gamepad.index === gamepadIndex) {
+        gamepadIndex = null;
+        setGamepadBadge(false);
+        stopGamepadLoop();
+        motorStop();
+      }
+    });
+
+    // Servo rate-limit for gamepad right stick (ms between steps)
+    const GP_SERVO_MS = 60;
+    let gpServoLast = 0;
+
+    function startGamepadLoop() {
+      if (gamepadLoop) return;
+      gamepadLoop = setInterval(tickGamepad, 50); // 20 Hz
+    }
+
+    function stopGamepadLoop() {
+      if (gamepadLoop) { clearInterval(gamepadLoop); gamepadLoop = null; }
+    }
+
+    let gpLastLeft = 0, gpLastRight = 0;
+    let gpRsWasPressed = false;
+
+    function tickGamepad() {
+      const gamepads = navigator.getGamepads ? navigator.getGamepads() : [];
+      const gp = gamepads[gamepadIndex];
+      if (!gp) return;
+
+      // ---- Left stick — tank drive ----
+      // axes[0] = left stick X,  axes[1] = left stick Y
+      const lx = applyDeadzone(gp.axes[0], STICK_DEAD);
+      const ly = applyDeadzone(gp.axes[1], STICK_DEAD);
+
+      // Arcade mix: forward/back from Y, turn from X
+      const spd   = motorSpeed;
+      let gpLeft  = Math.round((-ly + lx) * spd);
+      let gpRight = Math.round((-ly - lx) * spd);
+      // clamp
+      gpLeft  = Math.max(-100, Math.min(100, gpLeft));
+      gpRight = Math.max(-100, Math.min(100, gpRight));
+
+      if (gpLeft !== gpLastLeft || gpRight !== gpLastRight) {
+        gpLastLeft  = gpLeft;
+        gpLastRight = gpRight;
+        if (gpLeft === 0 && gpRight === 0) motorStop();
+        else rampTarget(gpLeft, gpRight);
+      }
+
+      // ---- Right stick — servo pan/tilt ----
+      // axes[2] = right stick X, axes[3] = right stick Y
+      const rx = applyDeadzone(gp.axes[2], STICK_DEAD);
+      const ry = applyDeadzone(gp.axes[3], STICK_DEAD);
+      const now = Date.now();
+      if (now - gpServoLast > GP_SERVO_MS) {
+        if (Math.abs(rx) > 0.3) {
+          gpServoLast = now;
+          servoDir(rx > 0 ? "right" : "left");
+        } else if (Math.abs(ry) > 0.3) {
+          gpServoLast = now;
+          servoDir(ry > 0 ? "down" : "up");
+        }
+      }
+
+      // ---- LT / RT — speed control ----
+      // buttons[6] = LT, buttons[7] = RT  (standard mapping)
+      const lt = applyDeadzone(gp.buttons[6] ? gp.buttons[6].value : 0, TRIG_DEAD);
+      const rt = applyDeadzone(gp.buttons[7] ? gp.buttons[7].value : 0, TRIG_DEAD);
+      if (rt > 0) setMotorSpeed(motorSpeed + rt * TRIG_SPEED_RATE);
+      if (lt > 0) setMotorSpeed(motorSpeed - lt * TRIG_SPEED_RATE);
+
+      // ---- RS click (buttons[11]) — center servos ----
+      const rsPressed = !!(gp.buttons[11] && gp.buttons[11].pressed);
+      if (rsPressed && !gpRsWasPressed) {
+        fetch(apiBase() + "/servo/center", { cache: "no-store" }).catch(console.error);
+      }
+      gpRsWasPressed = rsPressed;
+    }
+
+    // Kick off gamepad detection for already-connected pads (page reload case)
+    setTimeout(() => {
+      const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+      for (const gp of gps) {
+        if (gp) { gamepadIndex = gp.index; setGamepadBadge(true, gp.id.slice(0, 20)); startGamepadLoop(); break; }
+      }
+    }, 500);
 
     // ---- Face tracking ----
     const faceTrackBtn = document.getElementById("faceTrackBtn");
@@ -1971,6 +2244,31 @@ app.get("/ui", (_req, res) => {
 
     qualitySelect.addEventListener("change", () => applyQuality(qualitySelect.value));
 
+    // ---- Fullscreen ----
+    const fullscreenBtn    = document.getElementById("fullscreenBtn");
+    const videoWrapper     = document.getElementById("videoWrapper");
+
+    function isFullscreen() {
+      return !!(document.fullscreenElement || document.webkitFullscreenElement);
+    }
+
+    fullscreenBtn.addEventListener("click", () => {
+      if (isFullscreen()) {
+        (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+      } else {
+        const req = videoWrapper.requestFullscreen || videoWrapper.webkitRequestFullscreen;
+        if (req) req.call(videoWrapper);
+      }
+    });
+
+    document.addEventListener("fullscreenchange",       updateFullscreenBtn);
+    document.addEventListener("webkitfullscreenchange", updateFullscreenBtn);
+
+    function updateFullscreenBtn() {
+      fullscreenBtn.textContent = isFullscreen() ? "✕" : "⛶";
+      fullscreenBtn.title       = isFullscreen() ? "Exit fullscreen" : "Fullscreen";
+    }
+
     // Connect the video stream — the server will auto-start the camera for us.
     // Quality is detected first so the server knows what resolution to use.
     testConnectionQuality().then(() => {
@@ -1985,10 +2283,144 @@ app.get("/ui", (_req, res) => {
 </html>`);
 });
 
+// -------------------- Motor Daemon --------------------
+let motorDaemon      = null;
+let motorReady       = false;
+let motorBuffer      = "";
+
+function startMotorDaemon() {
+  motorDaemon = spawn("python3", ["-u", MOTOR_SCRIPT], {
+    env: { ...process.env, PYTHONUNBUFFERED: "1" },
+  });
+
+  motorDaemon.stdout.on("data", (d) => {
+    motorBuffer += d.toString();
+    const lines = motorBuffer.split("\n");
+    motorBuffer = lines.pop();
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t) continue;
+      if (t === "READY") { motorReady = true; console.log("[Motor] daemon ready"); }
+      else console.log("[Motor]", t);
+    }
+  });
+
+  motorDaemon.stderr.on("data", (d) => console.error("[Motor stderr]", d.toString().trim()));
+  motorDaemon.on("error", (err) => console.error("[Motor] spawn error:", err));
+  motorDaemon.on("exit", (code) => {
+    console.log("[Motor] daemon exited with code", code);
+    motorReady  = false;
+    motorDaemon = null;
+    setTimeout(startMotorDaemon, 1000);
+  });
+}
+
+function motorCmd(cmd) {
+  if (!motorReady || !motorDaemon) return;
+  motorDaemon.stdin.write(cmd + "\n");
+}
+
+// API: /motor?left=<-100..100>&right=<-100..100>
+// Positive = forward, negative = backward, 0 = stop.
+app.get("/motor", (req, res) => {
+  const left  = Math.max(-100, Math.min(100, parseFloat(req.query.left)  || 0));
+  const right = Math.max(-100, Math.min(100, parseFloat(req.query.right) || 0));
+  motorCmd(`SET both ${left} ${right}`);
+  res.json({ left, right });
+});
+
+// API: /motor/stop
+app.get("/motor/stop", (_req, res) => {
+  motorCmd("STOP");
+  res.json({ stopped: true });
+});
+
+// -------------------- Boot sequence --------------------
+// Called once after servo daemon is ready.
+// 1. Servos → center.
+// 2. Vertical servo nods: up → center → down → center.
+// 3. Horizontal servo sweeps: left → center → right → center.
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function bootSequence() {
+  console.log("[Boot] running startup sequence…");
+
+  // ---- Servos: center ----
+  try {
+    await Promise.all([
+      servoCmd(`SET ${SERVO_H_CHANNEL} ${SERVO_CENTER}`),
+      servoCmd(servoSetCmd(SERVO_V_CHANNEL, SERVO_CENTER)),
+    ]);
+    writeServoState(SERVO_CENTER, SERVO_CENTER);
+    console.log("[Boot] servos centered");
+  } catch (e) {
+    console.error("[Boot] servo center failed:", e.message);
+  }
+
+  await sleep(400);
+
+  // ---- Servos: nod gesture (vertical only) ----
+  const nodSteps = [
+    SERVO_CENTER + 25,  // up
+    SERVO_CENTER,       // back to center
+    SERVO_CENTER - 20,  // down
+    SERVO_CENTER,       // back to center
+  ];
+  try {
+    for (const angle of nodSteps) {
+      await servoCmd(servoSetCmd(SERVO_V_CHANNEL, angle));
+      writeServoState(SERVO_CENTER, angle);
+      await sleep(350);
+    }
+    console.log("[Boot] nod gesture complete");
+  } catch (e) {
+    console.error("[Boot] nod gesture failed:", e.message);
+  }
+
+  await sleep(300);
+
+  // ---- Servos: sweep gesture (horizontal only) ----
+  const sweepSteps = [
+    SERVO_CENTER - 25,  // left
+    SERVO_CENTER,       // back to center
+    SERVO_CENTER + 25,  // right
+    SERVO_CENTER,       // back to center
+  ];
+  try {
+    for (const angle of sweepSteps) {
+      await servoCmd(`SET ${SERVO_H_CHANNEL} ${angle}`);
+      writeServoState(angle, SERVO_CENTER);
+      await sleep(350);
+    }
+    console.log("[Boot] sweep gesture complete");
+  } catch (e) {
+    console.error("[Boot] sweep gesture failed:", e.message);
+  }
+
+  console.log("[Boot] startup sequence done");
+}
+
+// Wait for servo daemon to signal ready, then run the sequence.
+function waitAndBoot() {
+  const deadline = Date.now() + 15000; // give up after 15 s
+  const check = setInterval(() => {
+    if (servoReady) {
+      clearInterval(check);
+      bootSequence();
+    } else if (Date.now() > deadline) {
+      clearInterval(check);
+      console.warn("[Boot] timed out waiting for servo daemon — skipping startup sequence");
+    }
+  }, 100);
+}
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Express running on http://0.0.0.0:${PORT}`);
   console.log(`UI: http://<pi-ip>:${PORT}/ui`);
-  // Start motion tracking immediately — it will wait for the stream internally
   startMotionTracking();
   console.log("[Boot] motion tracker started");
+  startMotorDaemon();
+  console.log("[Boot] motor daemon started");
+  waitAndBoot();
 });
